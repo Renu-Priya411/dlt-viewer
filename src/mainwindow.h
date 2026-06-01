@@ -29,6 +29,7 @@
 #include <QComboBox>
 #include <QProgressBar>
 #include <QVector>
+#include <QPointer>
 
 #include <QTableWidget>
 #include <QAbstractItemModel>
@@ -109,6 +110,7 @@ namespace Ui {
 }
 
 struct EcuTree;
+class QDltExporter;
 
 class MainWindow : public QMainWindow
 {
@@ -119,6 +121,8 @@ public:
     ~MainWindow();
 
 private:
+    void setupSortByTimestampToolbarButton();
+
     Ui::MainWindow *ui;
     /* Timer for connecting to ECUs */
     QTimer timer;
@@ -169,6 +173,7 @@ private:
 
     /* Export */
     ExporterDialog exporterDialog;
+    QPointer<QDltExporter> activeExporterThread;
 
     /* Settings dialog containing also the settings parameter itself */
     SettingsDialog *settingsDlg;
@@ -246,6 +251,9 @@ private:
     /* flag for enabled / disabled status of plugins */
     bool pluginsEnabled;
 
+    /* flag for enabled / disabled status of filters */
+    bool filtersEnabled;
+
     /* keep the target version string submited by the target for internal use */
     QString target_version_string;
 
@@ -286,6 +294,9 @@ private:
     void exportSelection(bool ascii,bool file,QDltExporter::DltExportFormat format);
     /* Exports search results from the search table view to clipboard or file in various formats. For clipboard operations: uses selected rows only and for file export operations: always exports all rows. */
     void exportSelection_searchTable(QDltExporter::DltExportFormat format, const QString& fileName = QString());
+    bool isExportInProgress() const;
+    bool startExportThread(QDltExporter *exporterThread, QModelIndexList *ownedSelection = nullptr);
+    void stopExportIfRunning();
 
     void ControlServiceRequest(EcuItem* ecuitem, uint32_t service_id);
     void SendInjection(EcuItem* ecuitem);
@@ -590,8 +601,6 @@ private slots:
     void on_actionDisconnectAll_triggered();
 
     // Config Items
-    void on_pluginsEnabled_toggled(bool checked);
-    void on_filtersEnabled_toggled(bool checked);
     void on_applyConfig_clicked();
     void on_tabWidget_currentChanged(int index);
 
@@ -601,14 +610,10 @@ private slots:
 
     void on_pushButtonDefaultFilterUpdateCache_clicked();
 
-    void on_checkBoxSortByTime_toggled(bool checked);
-    void on_checkBoxSortByTimestamp_toggled(bool checked);
-
     void on_actionMarker_triggered();
 
     void on_actionToggle_PluginsEnabled_triggered(bool checked);
     void on_actionToggle_FiltersEnabled_triggered(bool checked);
-
     void on_actionToggle_SortByTimeEnabled_triggered(bool checked);
     void on_actionSort_By_Timestamp_triggered(bool checked);
 

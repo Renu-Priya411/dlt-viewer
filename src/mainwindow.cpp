@@ -34,9 +34,11 @@
 #include <QLineEdit>
 #include <QUrl>
 #include <QDateTime>
+#include <QHash>
 #include <QLabel>
 #include <QInputDialog>
 #include <QByteArray>
+#include <QSet>
 #include <QSysInfo>
 #include <QSerialPort>
 #include <QSerialPortInfo>
@@ -53,6 +55,8 @@
 #include <QDirIterator>
 #include <QThread>
 #include <QTableWidget>
+#include <QToolButton>
+#include <QPainter>
 
 #if defined(_MSC_VER)
 #include <io.h>
@@ -88,9 +92,9 @@ MainWindow::MainWindow(QWidget *parent) :
     ui(new Ui::MainWindow),
     timer(this),
     qcontrol(this),
+    crlfFilterWindow(nullptr),
     pulseButtonColor(255, 40, 40),
-    isSearchOngoing(false),
-    crlfFilterWindow(nullptr)
+    isSearchOngoing(false)
 {
 
     dltIndexer = NULL;
@@ -98,6 +102,8 @@ MainWindow::MainWindow(QWidget *parent) :
     ui->setupUi(this);
     ui->enableConfigFrame->setVisible(false);
     setAcceptDrops(true);
+
+    setupSortByTimestampToolbarButton();
 
     target_version_string = "";
 
@@ -188,11 +194,16 @@ MainWindow::MainWindow(QWidget *parent) :
     /* update plugins again to hide plugins shown before after restoreState */
     updatePlugins();
 
-    /*sync checkboxes with action toolbar*/
-    ui->actionToggle_FiltersEnabled->setChecked(ui->filtersEnabled->isChecked());
-    ui->actionToggle_PluginsEnabled->setChecked(ui->pluginsEnabled->isChecked());
-    ui->actionToggle_SortByTimeEnabled->setChecked(ui->checkBoxSortByTime->isChecked());
-    ui->actionSort_By_Timestamp->setChecked(ui->checkBoxSortByTimestamp->isChecked());
+    /* sync toolbar with persisted state */
+    ui->actionToggle_FiltersEnabled->setChecked(filtersEnabled);
+    ui->actionToggle_PluginsEnabled->setChecked(pluginsEnabled);
+
+    const bool sortByTimeEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool();
+    const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+    ui->actionToggle_SortByTimeEnabled->setEnabled(filtersEnabled);
+    ui->actionToggle_SortByTimeEnabled->setChecked(filtersEnabled && sortByTimeEnabled);
+    ui->actionSort_By_Timestamp->setEnabled(filtersEnabled);
+    ui->actionSort_By_Timestamp->setChecked(filtersEnabled && sortByTimestampEnabled);
     ui->actionProject->setChecked(ui->dockWidgetContents->isVisible());
     ui->actionSearch_Results->setChecked(ui->dockWidgetSearchIndex->isVisible());
 
@@ -202,6 +213,63 @@ MainWindow::MainWindow(QWidget *parent) :
         this->setWindowState(Qt::WindowMinimized);
     }
 
+}
+
+void MainWindow::setupSortByTimestampToolbarButton()
+{
+    if(!ui || !ui->mainToolBar || !ui->actionSort_By_Timestamp)
+    {
+        return;
+    }
+
+    ui->actionSort_By_Timestamp->setIconVisibleInMenu(true);
+
+    QToolBar* toolbar = ui->mainToolBar;
+    QAction* action = ui->actionSort_By_Timestamp;
+
+    // Build a two-state icon: full opacity when ON (checked), faded when OFF (unchecked)
+    {
+        QPixmap normalPix(":/toolbar/png/sort-ts.png");
+
+        if(!normalPix.isNull())
+        {
+            QPixmap fadedPix(normalPix.size());
+            fadedPix.fill(Qt::transparent);
+            QPainter painter(&fadedPix);
+            painter.setOpacity(0.35);
+            painter.drawPixmap(0, 0, normalPix);
+            painter.end();
+
+            QIcon icon;
+            icon.addPixmap(normalPix, QIcon::Normal, QIcon::On);
+            icon.addPixmap(fadedPix,  QIcon::Normal, QIcon::Off);
+            action->setIcon(icon);
+        }
+    }
+
+    const QList<QAction*> toolbarActions = toolbar->actions();
+    int index = toolbarActions.indexOf(action);
+    QAction* beforeAction = nullptr;
+    if(index >= 0 && index + 1 < toolbarActions.size())
+    {
+        beforeAction = toolbarActions.at(index + 1);
+    }
+
+    if(index < 0)
+    {
+        return;
+    }
+
+    toolbar->removeAction(action);
+
+    auto* button = new QToolButton(toolbar);
+    button->setDefaultAction(action);
+    button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    button->setAutoRaise(true);
+    button->setFocusPolicy(Qt::NoFocus);
+    button->setAccessibleName(action->text());
+
+    toolbar->insertWidget(beforeAction, button);
 }
 
 MainWindow::~MainWindow()
@@ -749,19 +817,34 @@ void MainWindow::initFileHandling()
     connect(dltIndexer, SIGNAL(finished()), this, SLOT(indexDone()));
     connect(dltIndexer, SIGNAL(started()), this, SLOT(indexStart()));
 
-    /* Plugins/Filters enabled checkboxes */
+    /* Plugins/Filters enabled state (toolbar is the UI) */
     pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
-    dltIndexer->setPluginsEnabled(pluginsEnabled);
-    ui->pluginsEnabled->setChecked(pluginsEnabled);
+    filtersEnabled = QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool();
 
-    ui->filtersEnabled->setChecked(QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool());
-    ui->checkBoxSortByTime->setEnabled(ui->filtersEnabled->isChecked());
-    ui->checkBoxSortByTime->setChecked(QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool());
-    ui->checkBoxSortByTimestamp->setEnabled(ui->filtersEnabled->isChecked());
-    ui->checkBoxSortByTimestamp->setChecked(QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool());
-    ui->checkBoxFilterRange->setEnabled(ui->filtersEnabled->isChecked());
-    ui->lineEditFilterStart->setEnabled(ui->checkBoxFilterRange->isChecked() && ui->filtersEnabled->isChecked());
-    ui->lineEditFilterEnd->setEnabled(ui->checkBoxFilterRange->isChecked() && ui->filtersEnabled->isChecked());
+    dltIndexer->setPluginsEnabled(pluginsEnabled);
+    dltIndexer->setFiltersEnabled(filtersEnabled);
+
+    const bool sortByTimeEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool();
+    dltIndexer->setSortByTimeEnabled(filtersEnabled && sortByTimeEnabled);
+
+    const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+    dltIndexer->setSortByTimestampEnabled(filtersEnabled && sortByTimestampEnabled);
+
+    ui->checkBoxFilterRange->setEnabled(filtersEnabled);
+    ui->lineEditFilterStart->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    ui->lineEditFilterEnd->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    if(!filtersEnabled)
+    {
+        ui->checkBoxFilterRange->setStyleSheet("QCheckBox:disabled { color: gray; }");
+        ui->lineEditFilterStart->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+        ui->lineEditFilterEnd->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+    }
+    else
+    {
+        ui->checkBoxFilterRange->setStyleSheet("");
+        ui->lineEditFilterStart->setStyleSheet("");
+        ui->lineEditFilterEnd->setStyleSheet("");
+    }
 
     /* Process Project */
     if(QDltOptManager::getInstance()->isProjectFile())
@@ -1099,6 +1182,13 @@ void MainWindow::deleteactualFile()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    stopExportIfRunning();
+    if(isExportInProgress())
+    {
+        event->ignore();
+        return;
+    }
+
     // Shall we save the updated plugin execution priorities??
 
     settingsDlg->writeSettings(this);
@@ -1666,6 +1756,55 @@ bool MainWindow::isLiveLoggingActive() const
     return false;
 }
 
+bool MainWindow::isExportInProgress() const
+{
+    return activeExporterThread && activeExporterThread->isRunning();
+}
+
+bool MainWindow::startExportThread(QDltExporter *exporterThread, QModelIndexList *ownedSelection)
+{
+    if(!exporterThread)
+        return false;
+
+    if(isExportInProgress())
+    {
+        if(ownedSelection)
+            delete ownedSelection;
+        exporterThread->deleteLater();
+        QMessageBox::information(this, QString("DLT Viewer"),
+                                 QString("An export is already in progress. Please wait until it finishes."));
+        return false;
+    }
+
+    activeExporterThread = exporterThread;
+    connect(exporterThread, &QDltExporter::progress,    this, &MainWindow::progress);
+    connect(exporterThread, &QDltExporter::resultReady, this, &MainWindow::handleExportResults);
+    connect(exporterThread, &QDltExporter::finished,    exporterThread, &QObject::deleteLater);
+    connect(exporterThread, &QDltExporter::finished, this, [this, exporterThread, ownedSelection]() {
+        if(ownedSelection)
+            delete ownedSelection;
+        if(activeExporterThread == exporterThread)
+            activeExporterThread = nullptr;
+    });
+    statusProgressBar->show();
+    exporterThread->setPriority(QThread::LowPriority);
+    exporterThread->start();
+    return true;
+}
+
+void MainWindow::stopExportIfRunning()
+{
+    if(!isExportInProgress())
+        return;
+
+    activeExporterThread->requestInterruption();
+    if(!activeExporterThread->wait(5000))
+    {
+        QMessageBox::warning(this, QString("DLT Viewer"),
+                             QString("Export is still stopping. Please try again in a moment."));
+    }
+}
+
 bool MainWindow::manualMarkerUnionEnabled() const
 {
     return settings && settings->includeManualMarkersInFilter && !isLiveLoggingActive();
@@ -1835,6 +1974,13 @@ void MainWindow::exportSelection(bool ascii = true,bool file = false,QDltExporte
     Q_UNUSED(ascii);
     Q_UNUSED(file);
 
+    if(isExportInProgress())
+    {
+        QMessageBox::information(this, QString("DLT Viewer"),
+                                 QString("An export is already in progress. Please wait until it finishes."));
+        return;
+    }
+
     QModelIndexList list = ui->tableView->selectionModel()->selection().indexes();
 
     filterUpdate(); // update filters of qfile before starting Exporting for RegEx operation
@@ -1847,15 +1993,29 @@ void MainWindow::exportSelection(bool ascii = true,bool file = false,QDltExporte
 
 void MainWindow::exportSelection_searchTable(QDltExporter::DltExportFormat format = QDltExporter::FormatClipboard, const QString& fileName)
 {
+    if(isExportInProgress()) {
+        QMessageBox::information(this, QString("DLT Viewer"),
+                                 QString("An export is already in progress. Please wait until it finishes."));
+        return;
+    }
+
+    // Validate critical pointers first
+    if (!ui->tableView_SearchIndex || !ui->tableView_SearchIndex->model() || !ui->tableView_SearchIndex->selectionModel()) {
+        return;
+    }
+    if (!m_searchtableModel || !ui->tableView || !ui->tableView->selectionModel()) {
+        return;
+    }
+    if (!tableModel) {
+        return;
+    }
+
     const QModelIndexList list = ui->tableView_SearchIndex->selectionModel()->selectedRows();
     QModelIndexList allRows;
     for (int row = 0; row < ui->tableView_SearchIndex->model()->rowCount(); ++row) {
         QModelIndex idx = ui->tableView_SearchIndex->model()->index(row, 0);
         allRows.append(idx);
     }
-
-    // Clear the selection from main table.
-    ui->tableView->selectionModel()->clear();
 
     // Determine which rows to process based on operation type and selection
     QModelIndexList rowsToProcess;
@@ -1868,6 +2028,28 @@ void MainWindow::exportSelection_searchTable(QDltExporter::DltExportFormat forma
         rowsToProcess = list;
     }
 
+    if (rowsToProcess.isEmpty()) {
+        return;
+    }
+
+    filterUpdate();
+    if (qfile.size() == 0) {
+        return;
+    }
+
+    QHash<qint64, int> filteredRowByEntry;
+    if (qfile.isFilter()) {
+        const QVector<qint64> filterIndices = qfile.getIndexFilter();
+        filteredRowByEntry.reserve(filterIndices.size());
+        for (int filteredRow = 0; filteredRow < filterIndices.size(); ++filteredRow) {
+            filteredRowByEntry.insert(filterIndices.at(filteredRow), filteredRow);
+        }
+    }
+
+    QModelIndexList exportIndices;
+    exportIndices.reserve(rowsToProcess.size());
+    QSet<int> seenRows;
+
     // Convert the index from search table to main table entry...
     foreach(QModelIndex index, rowsToProcess)
     {
@@ -1877,24 +2059,43 @@ void MainWindow::exportSelection_searchTable(QDltExporter::DltExportFormat forma
         if (! m_searchtableModel->get_SearchResultEntry(position, entry) )
             return;
 
-        //jump_to_line
-        int row = nearest_line(entry);
+        int row = qfile.isFilter() ? filteredRowByEntry.value(static_cast<qint64>(entry), -1)
+                                   : static_cast<int>(entry);
         if (0 > row)
-            return;
+            continue; // Skip entries that are no longer available in the current view
+        if (seenRows.contains(row)) {
+            continue;
+        }
 
         QModelIndex newIndex = tableModel->index(row, 0, QModelIndex());
-        // Select the row in main table mapping to the search table row
-        ui->tableView->blockSignals(true);
-        ui->tableView->selectionModel()->select(newIndex, QItemSelectionModel::Select|QItemSelectionModel::Rows);
-        ui->tableView->blockSignals(false);
+        if (!newIndex.isValid()) {
+            continue;
+        }
+        seenRows.insert(row);
+        exportIndices.append(newIndex);
     }
 
-    QModelIndexList finallist = ui->tableView->selectionModel()->selection().indexes();
-
-    filterUpdate(); // update filters of qfile before starting Exporting for RegEx operation
+    if (exportIndices.isEmpty()) {
+        return;
+    }
 
     QString exportFile = fileName.trimmed();
-    QDltExporter exporter(&qfile,exportFile,&pluginManager,format,QDltExporter::SelectionSelected,&finallist,project.settings->automaticTimeSettings,project.settings->utcOffset,project.settings->dst,QDltOptManager::getInstance()->getDelimiter(),QDltOptManager::getInstance()->getSignature());
+
+    if (!exportFile.isEmpty()) {
+        QModelIndexList *exportIndicesForThread = new QModelIndexList(exportIndices);
+        QDltExporter *exporterThread = new QDltExporter(&qfile, exportFile, &pluginManager, format,
+                                                       QDltExporter::SelectionSelected, exportIndicesForThread,
+                                                       project.settings->automaticTimeSettings,
+                                                       project.settings->utcOffset,
+                                                       project.settings->dst,
+                                                       QDltOptManager::getInstance()->getDelimiter(),
+                                                       QDltOptManager::getInstance()->getSignature(), this);
+        statusProgressBar->reset();
+        startExportThread(exporterThread, exportIndicesForThread);
+        return;
+    }
+
+    QDltExporter exporter(&qfile,exportFile,&pluginManager,format,QDltExporter::SelectionSelected,&exportIndices,project.settings->automaticTimeSettings,project.settings->utcOffset,project.settings->dst,QDltOptManager::getInstance()->getDelimiter(),QDltOptManager::getInstance()->getSignature());
     connect(&exporter,SIGNAL(clipboard(QString)),this,SLOT(clipboard(QString)));
     exporter.exportMessages();
     disconnect(&exporter,SIGNAL(clipboard(QString)),this,SLOT(clipboard(QString)));
@@ -1902,6 +2103,13 @@ void MainWindow::exportSelection_searchTable(QDltExporter::DltExportFormat forma
 
 void MainWindow::on_actionExport_triggered()
 {
+    if(isExportInProgress())
+    {
+        QMessageBox::information(this, QString("DLT Viewer"),
+                                 QString("An export is already in progress. Please wait until it finishes."));
+        return;
+    }
+
     /* export dialog */
     exporterDialog.setRange(0,qfile.size());
     exporterDialog.exec();
@@ -2001,21 +2209,18 @@ void MainWindow::on_actionExport_triggered()
 
     filterUpdate(); // update filters of qfile before starting Exporting for RegEx operation
 
+    QModelIndexList *selectionForThread = nullptr;
     if(exportSelection == QDltExporter::SelectionSelected) // marked messages
     {
-        exporterThread = new QDltExporter(&qfile, fileName, &pluginManager,exportFormat,exportSelection,&list,project.settings->automaticTimeSettings,project.settings->utcOffset,project.settings->dst,QDltOptManager::getInstance()->getDelimiter(),QDltOptManager::getInstance()->getSignature(),this);
+        selectionForThread = new QModelIndexList(list);
+        exporterThread = new QDltExporter(&qfile, fileName, &pluginManager,exportFormat,exportSelection,selectionForThread,project.settings->automaticTimeSettings,project.settings->utcOffset,project.settings->dst,QDltOptManager::getInstance()->getDelimiter(),QDltOptManager::getInstance()->getSignature(),this);
     }
     else
     {
         exporterThread = new QDltExporter(&qfile, fileName, &pluginManager,exportFormat,exportSelection,0,project.settings->automaticTimeSettings,project.settings->utcOffset,project.settings->dst,QDltOptManager::getInstance()->getDelimiter(),QDltOptManager::getInstance()->getSignature(),this);
         exporterThread->exportMessageRange(startix,stopix);
     }
-    connect(exporterThread, &QDltExporter::progress,    this, &MainWindow::progress);
-    connect(exporterThread, &QDltExporter::resultReady, this, &MainWindow::handleExportResults);
-    connect(exporterThread, &QDltExporter::finished,    exporterThread, &QObject::deleteLater);
-    statusProgressBar->show();
-    exporterThread->setPriority(QThread::LowPriority);
-    exporterThread->start();
+    startExportThread(exporterThread, selectionForThread);
 }
 
 //call for spliting the DLT File
@@ -2367,9 +2572,12 @@ void MainWindow::reloadLogFileFinishFilter()
     }
 
     // enable filter if requested
-    qfile.enableFilter(QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool());
-    qfile.enableSortByTime(QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool());
-    qfile.enableSortByTimestamp(QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool());
+    qfile.enableFilter(filtersEnabled);
+    qfile.enableSortByTime(false);
+    {
+        const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+        qfile.enableSortByTimestamp(filtersEnabled && sortByTimestampEnabled);
+    }
 
     // updateIndex, if messages are received in between
     updateIndex();
@@ -2550,12 +2758,18 @@ void MainWindow::reloadLogFile(bool update, bool multithreaded)
     statusFilename->setText(fm.elidedText(name, Qt::ElideLeft, statusFilename->width()));
     statusFilename->setToolTip(name);
 
-    // enable plugins
+    // enable plugins/filters
     pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
+    filtersEnabled = QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool();
     dltIndexer->setPluginsEnabled(pluginsEnabled);
-    dltIndexer->setFiltersEnabled(QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool());
-    dltIndexer->setSortByTimeEnabled(QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool());
-    dltIndexer->setSortByTimestampEnabled(QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool());
+    dltIndexer->setFiltersEnabled(filtersEnabled);
+
+    {
+        const bool sortByTimeEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool();
+        const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+        dltIndexer->setSortByTimeEnabled(filtersEnabled && sortByTimeEnabled);
+        dltIndexer->setSortByTimestampEnabled(filtersEnabled && sortByTimestampEnabled);
+    }
     dltIndexer->setMultithreaded(multithreaded);
     dltIndexer->setFilterCacheEnabled(settings->filterCache);
 
@@ -2602,12 +2816,18 @@ void MainWindow::reloadLogFileDefaultFilter()
     statusProgressBar->reset();
     statusProgressBar->show();
 
-    // enable plugins
+    // enable plugins/filters
     pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
+    filtersEnabled = QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool();
     dltIndexer->setPluginsEnabled(pluginsEnabled);
-    dltIndexer->setFiltersEnabled(QDltSettingsManager::getInstance()->value("startup/filtersEnabled", true).toBool());
-    dltIndexer->setSortByTimeEnabled(QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool());
-    dltIndexer->setSortByTimestampEnabled(QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool());
+    dltIndexer->setFiltersEnabled(filtersEnabled);
+
+    {
+        const bool sortByTimeEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool();
+        const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+        dltIndexer->setSortByTimeEnabled(filtersEnabled && sortByTimeEnabled);
+        dltIndexer->setSortByTimestampEnabled(filtersEnabled && sortByTimestampEnabled);
+    }
 
     // start indexing
     dltIndexer->setPriority(QThread::NormalPriority);
@@ -4439,7 +4659,9 @@ void MainWindow::read(EcuItem* ecuitem)
           ecuitem->ipcon.add(data);
           break;
       case EcuItem::INTERFACETYPE_UDP:
-          while(ecuitem->udpsocket.hasPendingDatagrams() && udpMessageCounter<100)
+          // Allow high-volume ECU bursts to be drained in one readyRead() cycle.
+          // The previous limit of 100 datagrams could leave a growing backlog during production ECU ingestion.
+          while(ecuitem->udpsocket.hasPendingDatagrams() && udpMessageCounter<10000)
           {
             data.resize(ecuitem->udpsocket.pendingDatagramSize());
             bytesRcvd = ecuitem->udpsocket.readDatagram( data.data(), data.size() );
@@ -4508,6 +4730,8 @@ void MainWindow::read(EcuItem* ecuitem)
           break;
       case EcuItem::INTERFACETYPE_SERIAL_DLT:
       case EcuItem::INTERFACETYPE_SERIAL_ASCII:
+          if (!ecuitem->m_serialport)
+              break;
           data = ecuitem->m_serialport->readAll();
           bytesRcvd = data.size();
           ecuitem->serialcon.add(data);
@@ -7582,6 +7806,13 @@ void MainWindow::onActionMenuConfigSearchTableCopyJiraHeadToClipboardTriggered()
 
 void MainWindow::onActionMenuConfigSearchTableExportDltTriggered()
 {
+    // Check if search results are empty before showing file dialog
+    if (!m_searchtableModel || m_searchtableModel->get_SearchResultListSize() == 0) {
+        QMessageBox::information(this, QString("DLT Viewer"),
+                                 QString("No search results to export."));
+        return;
+    }
+
     QString fileName = QFileDialog::getSaveFileName(
         this,
         tr("Export Search Results as DLT"),
@@ -7830,7 +8061,8 @@ void MainWindow::onActionMenuConfigSaveAllECUsTriggered()
 {
     QString filename = QFileDialog::getSaveFileName(this, tr("Save DLT Filters"), workingDirectory.getDltDirectory(), tr("Save APID/CTID list (*.csv);;All files (*.*)"));
     QFile asciiFile(filename);
-    asciiFile.open(QIODevice::WriteOnly);
+    if(!asciiFile.open(QIODevice::WriteOnly))
+        return;
 
     // go over ECU Items
     for(int num = 0; num < project.ecu->topLevelItemCount (); num++)
@@ -8021,21 +8253,68 @@ void MainWindow::on_actionJump_To_triggered()
 
 void MainWindow::on_actionToggle_FiltersEnabled_triggered(bool checked)
 {
-    ui->filtersEnabled->setChecked(checked);
+    filtersEnabled = checked;
+    QDltSettingsManager::getInstance()->setValue("startup/filtersEnabled", filtersEnabled);
+    dltIndexer->setFiltersEnabled(filtersEnabled);
+
+    if(!filtersEnabled)
+    {
+        /* Sorting only makes sense with filters enabled */
+        QDltSettingsManager::getInstance()->setValue("startup/sortByTimeEnabled", false);
+        QDltSettingsManager::getInstance()->setValue("startup/sortByTimestampEnabled", false);
+    }
+
+    /* Update dependent UI controls */
+    ui->checkBoxFilterRange->setEnabled(filtersEnabled);
+    ui->lineEditFilterStart->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    ui->lineEditFilterEnd->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    if(!filtersEnabled)
+    {
+        ui->checkBoxFilterRange->setStyleSheet("QCheckBox:disabled { color: gray; }");
+        ui->lineEditFilterStart->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+        ui->lineEditFilterEnd->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+    }
+    else
+    {
+        ui->checkBoxFilterRange->setStyleSheet("");
+        ui->lineEditFilterStart->setStyleSheet("");
+        ui->lineEditFilterEnd->setStyleSheet("");
+    }
+
+    syncCheckBoxesAndMenu();
+
     ui->applyConfig->setFocus(); // have to set different focus first, so that scrollTo() works
     on_applyConfig_clicked();
 }
 
 void MainWindow::on_actionToggle_SortByTimeEnabled_triggered(bool checked)
 {
-    ui->checkBoxSortByTime->setChecked(checked);
+    if(!filtersEnabled)
+    {
+        QDltSettingsManager::getInstance()->setValue("startup/sortByTimeEnabled", false);
+        syncCheckBoxesAndMenu();
+        return;
+    }
+
+    QDltSettingsManager::getInstance()->setValue("startup/sortByTimeEnabled", checked);
+    syncCheckBoxesAndMenu();
+
     ui->applyConfig->setFocus(); // have to set different focus first, so that scrollTo() works
     on_applyConfig_clicked();
 }
 
 void MainWindow::on_actionSort_By_Timestamp_triggered(bool checked)
 {
-    ui->checkBoxSortByTimestamp->setChecked(checked);
+    if(!filtersEnabled)
+    {
+        QDltSettingsManager::getInstance()->setValue("startup/sortByTimestampEnabled", false);
+        syncCheckBoxesAndMenu();
+        return;
+    }
+
+    QDltSettingsManager::getInstance()->setValue("startup/sortByTimestampEnabled", checked);
+    syncCheckBoxesAndMenu();
+
     ui->applyConfig->setFocus(); // have to set different focus first, so that scrollTo() works
     on_applyConfig_clicked();
 }
@@ -8068,61 +8347,10 @@ void MainWindow::on_actionDisconnectAll_triggered()
 void MainWindow::on_actionToggle_PluginsEnabled_triggered(bool checked)
 {
     pluginsEnabled = checked;
-    ui->pluginsEnabled->setChecked(pluginsEnabled); // set checkbox in UI
     QDltSettingsManager::getInstance()->setValue("startup/pluginsEnabled", pluginsEnabled);
     dltIndexer->setPluginsEnabled(pluginsEnabled);
     ui->applyConfig->setFocus(); // have to set different focus first, so that scrollTo() works
     syncCheckBoxesAndMenu();
-    applyConfigEnabled(true);
-}
-
-/* This one is called when the checkbox "Plugins Enabled" is checked/unchecked */
-void MainWindow::on_pluginsEnabled_toggled(bool checked)
-{
-    pluginsEnabled = checked;
-    QDltSettingsManager::getInstance()->setValue("startup/pluginsEnabled", pluginsEnabled); // set settings
-    dltIndexer->setPluginsEnabled(pluginsEnabled); // inform indexer
-    // now we should correlate the "plugin menu entry to disable / enable"
-    syncCheckBoxesAndMenu();
-    applyConfigEnabled(true);
-}
-
-void MainWindow::on_filtersEnabled_toggled(bool checked)
-{
-    //QDltSettingsManager::getInstance()->setValue("startup/filtersEnabled", checked);
-    QDltSettingsManager::getInstance()->setValue("startup/filtersEnabled", checked);
-    ui->checkBoxSortByTime->setEnabled(checked);
-    ui->checkBoxSortByTimestamp->setEnabled(checked);
-    ui->checkBoxFilterRange->setEnabled(checked);
-    ui->lineEditFilterStart->setEnabled(ui->checkBoxFilterRange->isChecked() & checked);
-    ui->lineEditFilterEnd->setEnabled(ui->checkBoxFilterRange->isChecked() & checked);
-
-    applyConfigEnabled(true);
-}
-
-void MainWindow::on_checkBoxSortByTime_toggled(bool checked)
-{
-    QDltSettingsManager::getInstance()->setValue("startup/sortByTimeEnabled", checked);
-    if(checked)
-    {
-        QDltSettingsManager::getInstance()->setValue("startup/sortByTimestampEnabled", false);
-        ui->checkBoxSortByTimestamp->setChecked(false);
-    }
-    ui->actionToggle_SortByTimeEnabled->setChecked(ui->checkBoxSortByTime->isChecked());
-    ui->actionSort_By_Timestamp->setChecked(ui->checkBoxSortByTimestamp->isChecked());
-    applyConfigEnabled(true);
-}
-
-void MainWindow::on_checkBoxSortByTimestamp_toggled(bool checked)
-{
-    if(checked)
-    {
-        QDltSettingsManager::getInstance()->setValue("startup/sortByTimeEnabled", false);
-        ui->checkBoxSortByTime->setChecked(false);
-    }
-    QDltSettingsManager::getInstance()->setValue("startup/sortByTimestampEnabled", checked);
-    ui->actionToggle_SortByTimeEnabled->setChecked(ui->checkBoxSortByTime->isChecked());
-    ui->actionSort_By_Timestamp->setChecked(ui->checkBoxSortByTimestamp->isChecked());
     applyConfigEnabled(true);
 }
 
@@ -8133,30 +8361,33 @@ void MainWindow::syncCheckBoxesAndMenu()
     for(auto& plugin : pluginList)
         plugin->configurationChanged();
 
-    ui->actionToggle_SortByTimeEnabled->setChecked(ui->checkBoxSortByTime->isChecked());
-    ui->actionSort_By_Timestamp->setChecked(ui->checkBoxSortByTimestamp->isChecked());
+    ui->actionToggle_PluginsEnabled->setChecked(pluginsEnabled);
+    ui->actionToggle_PluginsEnabled->setText(pluginsEnabled ? "Disable Plugins" : "Enable Plugins");
 
-    ui->actionToggle_PluginsEnabled->setChecked(ui->pluginsEnabled->isChecked());
-    if (ui->pluginsEnabled->isChecked())
-        {
-            ui->actionToggle_PluginsEnabled->setText("Disable Plugins");
-        }
-        else
-        {
-            ui->actionToggle_PluginsEnabled->setText("Enable Plugins");
-        }
+    ui->actionToggle_FiltersEnabled->setChecked(filtersEnabled);
+    ui->actionToggle_FiltersEnabled->setText(filtersEnabled ? "Disable Filters" : "Enable Filters");
 
-    ui->actionToggle_FiltersEnabled->setChecked(ui->filtersEnabled->isChecked());
-    if (ui->filtersEnabled->isChecked())
-        {
-            ui->actionToggle_FiltersEnabled->setText("Disable Filters");
-        }
-        else
-        {
-            ui->actionToggle_FiltersEnabled->setText("Enable Filters");
-        }
-
-
+    const bool sortByTimeEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimeEnabled", false).toBool();
+    const bool sortByTimestampEnabled = QDltSettingsManager::getInstance()->value("startup/sortByTimestampEnabled", false).toBool();
+    ui->actionToggle_SortByTimeEnabled->setEnabled(filtersEnabled);
+    ui->actionToggle_SortByTimeEnabled->setChecked(filtersEnabled && sortByTimeEnabled);
+    ui->actionSort_By_Timestamp->setEnabled(filtersEnabled);
+    ui->actionSort_By_Timestamp->setChecked(filtersEnabled && sortByTimestampEnabled);
+    ui->checkBoxFilterRange->setEnabled(filtersEnabled);
+    ui->lineEditFilterStart->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    ui->lineEditFilterEnd->setEnabled(ui->checkBoxFilterRange->isChecked() && filtersEnabled);
+    if(!filtersEnabled)
+    {
+        ui->checkBoxFilterRange->setStyleSheet("QCheckBox:disabled { color: gray; }");
+        ui->lineEditFilterStart->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+        ui->lineEditFilterEnd->setStyleSheet("QLineEdit:disabled { color: gray; background-color: #efefef; }");
+    }
+    else
+    {
+        ui->checkBoxFilterRange->setStyleSheet("");
+        ui->lineEditFilterStart->setStyleSheet("");
+        ui->lineEditFilterEnd->setStyleSheet("");
+    }
 }
 
 void MainWindow::on_applyConfig_clicked()
@@ -8523,8 +8754,8 @@ void MainWindow::on_checkBoxFilterRange_stateChanged(int arg1)
 {
     applyConfigEnabled(true);
 
-    ui->lineEditFilterStart->setEnabled(arg1==Qt::Checked);
-    ui->lineEditFilterEnd->setEnabled(arg1==Qt::Checked);
+    ui->lineEditFilterStart->setEnabled(arg1==Qt::Checked && filtersEnabled);
+    ui->lineEditFilterEnd->setEnabled(arg1==Qt::Checked && filtersEnabled);
 }
 
 void MainWindow::on_lineEditFilterStart_textChanged(const QString &arg1)
@@ -8547,5 +8778,6 @@ void MainWindow::handleImportResults(const QString &)
 
 void MainWindow::handleExportResults(const QString &)
 {
+    activeExporterThread = nullptr;
     statusProgressBar->hide();
 }
