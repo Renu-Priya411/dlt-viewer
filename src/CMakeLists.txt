@@ -82,8 +82,6 @@ add_executable(dlt-viewer
     filtergrouplogs.cpp
     filterthreadworker.h
     filterthreadworker.cpp
-    indexthreadworker.h
-    indexthreadworker.cpp
     crlfindexviewmodel.h
     crlfindexviewmodel.cpp
     crlffilterwindow.h

@@ -24,9 +24,6 @@
 
 #include "project.h"
 #include "qdltpluginmanager.h"
-#include <qdltlrucache.hpp>
-
-#include <optional>
 
 #define DLT_VIEWER_SEARCHCOLUMN_COUNT FieldNames::Arg0
 
@@ -49,7 +46,6 @@ public:
 
     void clear_SearchResults();
     void add_SearchResultEntry(unsigned long entry);
-    void add_SearchResultEntries(const QList<unsigned long>& entries);
 
 
     int get_SearchResultListSize() const;
@@ -69,37 +65,6 @@ public slots:
 
 public:
     QList <unsigned long> m_searchResultList;
-
-private:
-    mutable QDltLruCache<unsigned long, std::optional<QDltMsg>> m_decodeCache{1024};
-    mutable QDltLruCache<quint64, QVariant> m_renderCache{4096};
-
-    /**
-     * @brief Builds a render-cache key from message index and column.
-     * @param msgIndex Message index.
-     * @param column Column number.
-     * @return Composite cache key.
-     */
-    quint64 renderCacheKey(unsigned long msgIndex, int column) const;
-
-    /**
-     * @brief Fetches and decodes a message with cache support.
-     * @param msgIndex Message index.
-     * @param msg Output decoded message.
-     * @return True when message is available and decoded.
-     */
-    bool tryGetDecodedMsg(unsigned long msgIndex, QDltMsg &msg) const;
-
-    /**
-     * @brief Produces table display text/value for one cell.
-     * @param index Target model index.
-     * @param msg Decoded message buffer.
-     * @param hasMessage True when @p msg contains valid data.
-     * @param msgIndex Message index.
-     * @return Cell display value.
-     */
-    QVariant buildDisplayData(const QModelIndex &index, QDltMsg &msg, bool hasMessage, unsigned long msgIndex) const;
-    
 };
 
 #endif // SEARCHTABLEMODEL_H

@@ -95,15 +95,7 @@ TableModel::TableModel(const QString & /*data*/, QObject *parent)
 
      if (role == Qt::DisplayRole)
      {
-         const quint64 cacheKey = renderCacheKey(index.row(), index.column());
-         if (m_renderCache.exists(cacheKey))
-         {
-             return m_renderCache.get(cacheKey);
-         }
-
-         const QVariant displayData = buildDisplayData(index, msg, filterposindex);
-         m_renderCache.put(cacheKey, displayData);
-         return displayData;
+         return buildDisplayData(index, msg, filterposindex);
      }
 
      if ( role == Qt::ForegroundRole )
@@ -181,7 +173,6 @@ QVariant TableModel::headerData(int section, Qt::Orientation orientation,
  void TableModel::modelChanged()
  {
      m_cache.clear();
-     m_renderCache.clear();
 
      const int rows = rowCount();
      if(rows > 0)
@@ -219,12 +210,6 @@ void TableModel::appendRows(int firstRow, int lastRow)
 
     beginInsertRows(QModelIndex(), firstRow, lastRow);
     endInsertRows();
-}
-
-quint64 TableModel::renderCacheKey(int row, int column) const
-{
-    return (static_cast<quint64>(static_cast<quint32>(row)) << 32) |
-           static_cast<quint32>(column);
 }
 
 QVariant TableModel::buildDisplayData(const QModelIndex &index, std::optional<QDltMsg> &msg, long int filterposindex) const

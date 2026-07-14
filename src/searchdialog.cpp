@@ -32,27 +32,13 @@
 #include <QSignalBlocker>
 #include <QColorDialog>
 #include <QAction>
-#include <QPointer>
-#include <QThreadPool>
-#include <QThread>
 #include <QDebug>
-#include <QtConcurrent/QtConcurrent>
 
 SearchDialog::SearchDialog(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::SearchDialog)
 {
     ui->setupUi(this);
-
-    const int idealThreads = QThread::idealThreadCount();
-    const int workerCount = (idealThreads > 0) ? qMin(4, idealThreads) : 4;
-    m_searchThreadPool.setMaxThreadCount(qMax(1, workerCount));
-#if QT_VERSION >= QT_VERSION_CHECK(6, 2, 0)
-    m_searchThreadPool.setThreadPriority(QThread::NormalPriority);
-#endif
-
-    connect(&m_findAllWatcher, &QFutureWatcher<int>::finished,
-            this, &SearchDialog::onFindAllFinished);
 
     regexpCheckBox = ui->checkBoxRegExp;
     match = false;
@@ -104,14 +90,6 @@ SearchDialog::SearchDialog(QWidget *parent) :
 
 SearchDialog::~SearchDialog()
 {
-    // Avoid use-after-free if a background Find-All search is still running.
-    if (m_findAllWatcher.isRunning())
-    {
-        isSearchCancelled.store(true, std::memory_order_relaxed);
-        m_findAllWatcher.future().cancel();
-        m_findAllWatcher.waitForFinished();
-    }
-
     clearCacheHistory();
     delete ui;
 }
@@ -144,305 +122,11 @@ QString SearchDialog::getText() { return ui->lineEditSearch->text(); }
 void SearchDialog::abortSearch()
 {
     isSearchCancelled.store(true, std::memory_order_relaxed);
-    if (m_findAllWatcher.isRunning())
-        m_findAllWatcher.future().cancel();
 }
 
 void SearchDialog::reportProgress(int progress)
 {
     emit searchProgressValueChanged(progress);
-}
-
-SearchDialog::StableRowMap SearchDialog::createStableRowMap() const
-{
-    StableRowMap stableRows;
-
-    if(!file)
-    {
-        return stableRows;
-    }
-
-    const int totalRows = file->sizeFilter();
-    stableRows.rowsToMsgIndex.reserve(totalRows);
-    for(int row = 0; row < totalRows; ++row)
-    {
-        stableRows.rowsToMsgIndex.push_back(file->getMsgFilterPos(row));
-    }
-
-    return stableRows;
-}
-
-int SearchDialog::stableRowCount(const StableRowMap &stableRows) const
-{
-    return stableRows.rowsToMsgIndex.size();
-}
-
-bool SearchDialog::isValidStableRow(int row, const StableRowMap &stableRows) const
-{
-    return row >= 0 && row < stableRowCount(stableRows);
-}
-
-int SearchDialog::stableMsgIndexAt(int row, const StableRowMap &stableRows) const
-{
-    if(!isValidStableRow(row, stableRows))
-    {
-        return -1;
-    }
-    return stableRows.rowsToMsgIndex.at(row);
-}
-
-void SearchDialog::runPendingFindAllIfAny()
-{
-    if(!m_pendingFindAllRequest.has_value())
-    {
-        return;
-    }
-
-    const PendingFindAllRequest pending = *m_pendingFindAllRequest;
-    m_pendingFindAllRequest.reset();
-    startParallelFindAll(pending.regExp, pending.priority);
-}
-
-void SearchDialog::appendFindAllMatchesChunk(const QList<unsigned long>& entries)
-{
-    if (!m_searchtablemodel)
-        return;
-
-    if (entries.isEmpty())
-        return;
-
-    const bool wasEmpty = (m_searchtablemodel->get_SearchResultListSize() == 0);
-    // Preserve the scan order (which matches the current filtered/sorted view).
-    // Do not sort by raw msg index; that breaks ordering when the view is sorted by time/timestamp.
-    m_searchtablemodel->add_SearchResultEntries(entries);
-
-    m_findAllAddedSinceLastUiUpdate += entries.size();
-
-    // Throttle table refreshes to keep UI responsive.
-    const qint64 nowMs = m_findAllUiUpdateTimer.elapsed();
-    const bool timeToUpdate = (nowMs - m_findAllLastUiUpdateMs) >= 200;
-    const bool manyNewItems = m_findAllAddedSinceLastUiUpdate >= 2000;
-
-    if (wasEmpty || timeToUpdate || manyNewItems)
-    {
-        m_findAllLastUiUpdateMs = nowMs;
-        m_findAllAddedSinceLastUiUpdate = 0;
-        emit refreshedSearchIndex();
-    }
-}
-
-void SearchDialog::startParallelFindAll(QRegularExpression searchTextRegExp, SearchPriority priority)
-{
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    Q_UNUSED(searchTextRegExp);
-    Q_UNUSED(priority);
-    // Parallel Find-All is only enabled for Qt6+.
-    return;
-#else
-    if (!file)
-        return;
-
-    if (m_findAllWatcher.isRunning())
-    {
-        // Queue the latest request and mark it urgent; it should run next.
-        m_pendingFindAllRequest = PendingFindAllRequest{searchTextRegExp, SearchPriority::Urgent};
-        isSearchCancelled.store(true, std::memory_order_relaxed);
-        m_findAllWatcher.future().cancel();
-        return;
-    }
-
-    if(priority == SearchPriority::Urgent)
-    {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 2, 0)
-        m_searchThreadPool.setThreadPriority(QThread::HighPriority);
-#endif
-    }
-    else
-    {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 2, 0)
-        m_searchThreadPool.setThreadPriority(QThread::NormalPriority);
-#endif
-    }
-
-    isSearchCancelled.store(false, std::memory_order_relaxed);
-
-    m_findAllUiUpdateTimer.restart();
-    m_findAllLastUiUpdateMs = 0;
-    m_findAllAddedSinceLastUiUpdate = 0;
-
-    const StableRowMap stableRows = createStableRowMap();
-    const int stableRowTotal = stableRowCount(stableRows);
-
-    m_searchtablemodel->clear_SearchResults();
-    emit refreshedSearchIndex();
-
-    if (stableRowTotal <= 0)
-    {
-        emit searchProgressChanged(false);
-        runPendingFindAllIfAny();
-        return;
-    }
-
-    const bool msgIdEnabled = QDltSettingsManager::getInstance()->value("startup/showMsgId", true).toBool();
-    const QString msgIdFormat = QDltSettingsManager::getInstance()->value("startup/msgIdFormat", "0x%x").toString();
-    const bool pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
-
-    // Optimization: only decode when payload search is enabled.
-    const bool payloadEnabled = getPayload();
-    const bool doDecode = pluginsEnabled && payloadEnabled;
-
-    const bool headerEnabled = getHeader();
-    const bool caseSensitive = getCaseSensitive();
-    const bool useRegExp = getRegExp();
-    const QString searchText = getText();
-
-    const QString apid = stApid;
-    const QString ctid = stCtid;
-
-    const bool timestampRangeEnabled = (ui->radioTimestamp->isChecked() && is_TimeStampSearchSelected);
-    const double tsStart = dTimeStampStart;
-    const double tsStop = dTimeStampStop;
-    const bool timeRangeEnabled = ui->radioTime->isChecked();
-    const QDateTime timeStart = ui->dateTimeStart->dateTime();
-    const QDateTime timeEnd = ui->dateTimeEnd->dateTime();
-
-    struct Chunk {
-        int begin;
-        int end;
-    };
-
-    const int maxThreads = qMax(1, m_searchThreadPool.maxThreadCount());
-
-    // Use more chunks than threads so some chunks complete early and we can show results sooner.
-    // Keep it bounded to avoid too many tasks.
-    // Also cap chunk size so any single task doesn't run for too long.
-    const int maxChunkSize = 20000;
-    const int baseChunks = qMin(stableRowTotal, maxThreads * 8);
-    const int minChunksForMaxSize = (stableRowTotal + maxChunkSize - 1) / maxChunkSize; // ensures chunkSize <= maxChunkSize
-    const int desiredChunks = qMax(baseChunks, minChunksForMaxSize);
-    const int chunkSize = qMax(1, (stableRowTotal + desiredChunks - 1) / desiredChunks);
-
-    QVector<Chunk> chunks;
-    chunks.reserve((stableRowTotal + chunkSize - 1) / chunkSize);
-    for (int begin = 0; begin < stableRowTotal; begin += chunkSize)
-    {
-        const int end = qMin(stableRowTotal - 1, begin + chunkSize - 1);
-        chunks.push_back(Chunk{begin, end});
-    }
-
-    auto processed = std::make_shared<std::atomic<int>>(0);
-    const QPointer<SearchDialog> dlg(this);
-    QDltFile* filePtr = file;
-    QDltPluginManager* pluginPtr = pluginManager;
-    const auto stableRowsPtr = std::make_shared<StableRowMap>(stableRows);
-
-    auto mapFn = [=](const Chunk& chunk) -> QList<unsigned long> {
-        QList<unsigned long> matches;
-        matches.reserve(qMax(0, chunk.end - chunk.begin + 1) / 16);
-
-        DltMessageMatcher matcher;
-        matcher.setCaseSentivity(caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive);
-        matcher.setSearchAppId(apid);
-        matcher.setSearchCtxId(ctid);
-        if (timestampRangeEnabled)
-            matcher.setTimestampRange(tsStart, tsStop);
-        if (timeRangeEnabled)
-            matcher.setTimeRange(timeStart, timeEnd);
-        if (msgIdEnabled)
-            matcher.setMessageIdFormat(msgIdFormat);
-        matcher.setHeaderSearchEnabled(headerEnabled);
-        matcher.setPayloadSearchEnabled(payloadEnabled);
-
-        QDltMsg msg;
-        QByteArray buf;
-
-        for (int i = chunk.begin; i <= chunk.end; ++i)
-        {
-            if (dlg && dlg->isSearchCancelled.load(std::memory_order_relaxed))
-                break;
-
-            const int msgIndex = stableRowsPtr->rowsToMsgIndex.at(i);
-            if (msgIndex < 0)
-                continue;
-
-            buf = filePtr->getMsg(msgIndex);
-            if (buf.isEmpty())
-                continue;
-
-            msg.setMsg(buf);
-            msg.setIndex(msgIndex);
-
-            DecodeManager::instance().decode(pluginPtr, msg, doDecode, dlg ? dlg->fSilentMode : 0);
-
-            const bool ok = useRegExp ? matcher.match(msg, searchTextRegExp)
-                                      : matcher.match(msg, searchText);
-            if (ok)
-                matches.append(static_cast<unsigned long>(msgIndex));
-
-            const int done = processed->fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((done % 2000) == 0)
-            {
-                const int progress = static_cast<int>(done * 100.0 / stableRowTotal);
-                if (dlg)
-                {
-                    QMetaObject::invokeMethod(dlg, [dlg, progress]() {
-                        if (dlg)
-                            dlg->reportProgress(progress);
-                    }, Qt::QueuedConnection);
-                }
-            }
-        }
-
-        return matches;
-    };
-
-    auto reduceFn = [dlg](int& matchCount, const QList<unsigned long>& matches) {
-        matchCount += matches.size();
-        if (dlg && !matches.isEmpty())
-        {
-            QMetaObject::invokeMethod(dlg, [dlg, matches]() {
-                if (dlg)
-                    dlg->appendFindAllMatchesChunk(matches);
-            }, Qt::QueuedConnection);
-        }
-    };
-
-    auto future = QtConcurrent::mappedReduced<int>(
-        &m_searchThreadPool,
-        chunks,
-        mapFn,
-        reduceFn,
-        0,
-        QtConcurrent::OrderedReduce | QtConcurrent::SequentialReduce);
-    m_findAllWatcher.setFuture(future);
-#endif
-}
-
-void SearchDialog::onFindAllFinished()
-{
-    if(m_pendingFindAllRequest.has_value())
-    {
-        runPendingFindAllIfAny();
-        return;
-    }
-
-    // Ensure the last batch of incremental updates is reflected.
-    emit refreshedSearchIndex();
-
-    emit searchProgressChanged(false);
-
-    // Do not rebuild the model here; it was built incrementally during reduce.
-    cacheSearchHistory();
-
-    match = (m_searchtablemodel && m_searchtablemodel->get_SearchResultListSize() > 0);
-    const int colourResult = match ? 1 : 0;
-
-    for (int i = 0; i < lineEdits.size(); ++i)
-        setSearchColour(lineEdits.at(i), colourResult);
-
-    if (!match)
-        setStartLine(-1);
-
 }
 
 bool SearchDialog::getHeader()
@@ -579,10 +263,9 @@ int SearchDialog::find()
 
     emit searchProgressChanged(true);
 
-    const StableRowMap stableRows = createStableRowMap();
-    const int stableRowTotal = stableRowCount(stableRows);
+    const int totalRows = file ? file->sizeFilter() : 0;
 
-    if(stableRowTotal == 0)
+    if(totalRows == 0)
     {
         emit searchProgressChanged(false);
         return 0;
@@ -638,7 +321,7 @@ int SearchDialog::find()
     {
         if(getNextClicked() || searchtoIndex())
         {
-            searchBorder = stableRowTotal == 0 ? 0 : stableRowTotal - 1;
+            searchBorder = totalRows - 1;
         }
         else
         {
@@ -711,26 +394,15 @@ int SearchDialog::find()
 
     if (searchtoIndex() == true)
     {
-        // Find-All search:
-        // - Qt6+: run in parallel (QtConcurrent)
-        // - Qt5: run single-threaded (existing findMessages loop)
-    #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        // Run Find All on a worker thread so the UI stays responsive.
-        // Completion will update the model and emit searchProgressChanged(false).
-        const SearchPriority priority = getSearchFromBeginning() ? SearchPriority::Normal : SearchPriority::Urgent;
-        startParallelFindAll(searchTextRegExpression, priority);
-        return 1;
-    #else
-        findMessages(startLine, searchBorder, searchTextRegExpression, stableRows);
+        findMessages(startLine, searchBorder, searchTextRegExpression);
         emit refreshedSearchIndex();
         cacheSearchHistory();
         match = (m_searchtablemodel && m_searchtablemodel->get_SearchResultListSize() > 0);
         emit searchProgressChanged(false);
         return match ? 1 : 0;
-    #endif
     }
 
-    findMessages(startLine,searchBorder,searchTextRegExpression, stableRows);
+    findMessages(startLine,searchBorder,searchTextRegExpression);
 
     emit searchProgressChanged(false);
 
@@ -742,7 +414,7 @@ int SearchDialog::find()
     return 0;
 }
 
-void SearchDialog::findMessages(long int searchLine, long int searchBorder, QRegularExpression &searchTextRegExp, const StableRowMap &stableRows)
+void SearchDialog::findMessages(long int searchLine, long int searchBorder, QRegularExpression &searchTextRegExp)
 {
 
     QDltMsg msg;
@@ -757,7 +429,7 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
 
     m_searchtablemodel->clear_SearchResults();
 
-    const int totalRows = stableRowCount(stableRows);
+    const int totalRows = file ? file->sizeFilter() : 0;
     if(totalRows <= 0)
     {
         match = false;
@@ -817,12 +489,7 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
         }
 
         /* get the message with the selected item id */
-        const int msgIndex = stableMsgIndexAt(searchLine, stableRows);
-        if(msgIndex < 0)
-        {
-            continue;
-        }
-
+        const int msgIndex = file->getMsgFilterPos(searchLine);
         buf = file->getMsg(msgIndex);
         msg.setMsg(buf);
         msg.setIndex(msgIndex);
@@ -869,21 +536,6 @@ void SearchDialog::findNextClicked()
 {
     setNextClicked(true);
 
-    // In "Find All" mode, work happens asynchronously.
-    // Colour is updated on completion.
-    if (searchtoIndex())
-    {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        (void)find();
-        return;
-#else
-        int result = find();
-        for (int i = 0; i < lineEdits.size(); i++)
-            setSearchColour(lineEdits.at(i), result);
-        return;
-#endif
-    }
-
     int result = find();
     for(int i=0; i<lineEdits.size();i++)
         setSearchColour(lineEdits.at(i),result);
@@ -892,19 +544,6 @@ void SearchDialog::findNextClicked()
 void SearchDialog::findPreviousClicked()
 {
     setNextClicked(false);
-
-    if (searchtoIndex())
-    {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        (void)find();
-        return;
-#else
-        int result = find();
-        for (int i = 0; i < lineEdits.size(); i++)
-            setSearchColour(lineEdits.at(i), result);
-        return;
-#endif
-    }
 
     int result = find();
     for(int i=0; i<lineEdits.size();i++)

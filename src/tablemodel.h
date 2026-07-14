@@ -79,18 +79,8 @@ private:
     // cache is used in data()-method to avoid decoding of the same message multiple times
     // key is a message index in the qdltfile; message can fail to decode, in that case value is empty optional
     mutable QDltLruCache<long int, std::optional<QDltMsg>> m_cache{1};
-    // Cache formatted display values for recently painted cells to reduce UI-thread formatting churn.
-    mutable QDltLruCache<quint64, QVariant> m_renderCache{4096};
 
     long int searchhit;
-
-    /**
-     * @brief Builds a cache key for rendered cell values.
-     * @param row Row index.
-     * @param column Column index.
-     * @return Composite cache key.
-     */
-    quint64 renderCacheKey(int row, int column) const;
 
     /**
      * @brief Formats display value for a table cell.

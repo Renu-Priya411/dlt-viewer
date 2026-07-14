@@ -92,35 +92,12 @@
 
 namespace {
 
-const QEvent::Type BatchUpdateEventType = static_cast<QEvent::Type>(QEvent::User + 100);
-constexpr int LiveUpdateBatchIntervalMs = 100;
-constexpr int LiveUpdateBatchMaxEvents = 1000;
-
-class BatchUpdateEvent : public QEvent
-{
-public:
-    BatchUpdateEvent(int firstRow, int lastRow)
-        : QEvent(BatchUpdateEventType),
-          m_firstRow(firstRow),
-          m_lastRow(lastRow)
-    {
-    }
-
-    int firstRow() const { return m_firstRow; }
-    int lastRow() const { return m_lastRow; }
-
-private:
-    int m_firstRow;
-    int m_lastRow;
-};
-
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::MainWindow),
     timer(this),
-    m_liveBatchUpdateTimer(this),
     qcontrol(this),
     crlfFilterWindow(nullptr),
     pulseButtonColor(255, 40, 40),
@@ -306,12 +283,6 @@ MainWindow::~MainWindow()
 {
     timer.stop(); // stop the receive timeout timer in case it is running
     dltIndexer->stop(); // in case a thread is running we want to stop it
-
-    if(m_indexWorker)
-    {
-        m_indexWorker->stopWorker();
-        m_indexWorker->wait();
-    }
     /**
      * All plugin dockwidgets must be removed from the layout manually and
      * then deleted. This has to be done here, because they contain
@@ -401,10 +372,6 @@ void MainWindow::initState()
     updChecker = new UpdateChecker(this);
     updChecker->checkForUpdates(); //runs intervalPassed on start of DLT Viewer
     updChecker->startAutoCheck();// keeps the periodic check for every 120 mins
-
-    qRegisterMetaType<IndexThreadBatchResult>("IndexThreadBatchResult");
-    m_indexWorker = new IndexThreadWorker(&pluginManager, this);
-    m_indexWorker->start();
 
     if (QDltSettingsManager::UI_Colour::UI_Dark == QDltSettingsManager::getInstance()->uiColour)
     {
@@ -745,13 +712,6 @@ void MainWindow::initView()
 
 void MainWindow::initSignalConnections()
 {
-    connect(m_indexWorker, &IndexThreadWorker::batchProcessed,
-            this, &MainWindow::onIndexBatchProcessed,
-            Qt::QueuedConnection);
-    m_liveBatchUpdateTimer.setSingleShot(true);
-    connect(&m_liveBatchUpdateTimer, &QTimer::timeout,
-            this, &MainWindow::flushPendingBatchUpdateEvent);
-
     /* Initialize Search History */
     for (int i= 0; i < MaxSearchHistory; i++)
     {
@@ -4974,206 +4934,105 @@ void MainWindow::SplitTriggered(QString fileName)
 
 void MainWindow::updateIndex()
 {
-    if(m_indexUpdateInFlight)
-    {
-        m_indexUpdatePending = true;
-        return;
-    }
-
     pluginsEnabled = dltIndexer->getPluginsEnabled();
 
-    IndexThreadBatchContext batchContext;
-    batchContext.pluginsEnabled = pluginsEnabled;
-    batchContext.filtersEnabled = qfile.isFilter();
-    batchContext.silentMode = !QDltOptManager::getInstance()->issilentMode();
-    batchContext.dltv2Support = settings->supportDLTv2Decoding;
-    batchContext.filterList = qfile.getFilterList();
+    const int oldVisibleRowCount = tableModel ? tableModel->rowCount() : 0;
+    const bool filterEnabled = qfile.isFilter();
+    const bool silentMode = !QDltOptManager::getInstance()->issilentMode();
 
-    QVector<IndexThreadFileInput> filesToScan;
-    filesToScan.reserve(qfile.getNumberOfFiles());
-
-    int baseGlobalIndex = 0;
-    for(int fileIndex = 0; fileIndex < qfile.getNumberOfFiles(); ++fileIndex)
+    const int fileCount = qfile.getNumberOfFiles();
+    QVector<int> oldPerFileCount;
+    oldPerFileCount.reserve(fileCount);
+    for(int fileIndex = 0; fileIndex < fileCount; ++fileIndex)
     {
-        const int existingMessageCount = qfile.getFileMsgNumber(fileIndex);
-
-        IndexThreadFileInput input;
-        input.fileIndex = fileIndex;
-        input.baseGlobalIndex = baseGlobalIndex;
-        input.existingMessageCount = existingMessageCount;
-        input.fileName = qfile.getFileName(fileIndex);
-        input.lastIndexedPosition = qfile.getLastFileMessagePosition(fileIndex);
-        filesToScan.push_back(input);
-
-        baseGlobalIndex += existingMessageCount;
+        oldPerFileCount.push_back(qfile.getFileMsgNumber(fileIndex));
     }
 
-    if(filesToScan.isEmpty())
+    if(!qfile.updateIndex())
     {
         return;
     }
 
-    m_indexUpdateInFlight = true;
-    m_indexWorker->enqueueBatch(std::move(filesToScan), batchContext);
-}
-
-void MainWindow::processIndexBatchResult(const IndexThreadBatchResult &result)
-{
-    QList<QDltPlugin*> activeViewerPlugins = pluginManager.getViewerPlugins();
-    QDltPlugin *item = nullptr;
-
-    for(const IndexThreadFileResult &fileUpdate : result.fileUpdates)
+    QList<QDltPlugin*> activeViewerPlugins;
+    QDltPlugin *plugin = nullptr;
+    if(pluginsEnabled)
     {
-        qfile.appendDltIndices(fileUpdate.newPositions, fileUpdate.fileIndex);
+        activeViewerPlugins = pluginManager.getViewerPlugins();
     }
 
-    qfile.addFilterIndices(result.matchingIndices);
-
-    if(result.pluginsEnabled && !result.items.isEmpty())
+    bool pluginUpdateStarted = false;
+    int globalBaseIndex = 0;
+    for(int fileIndex = 0; fileIndex < fileCount; ++fileIndex)
     {
-        for(int i = 0; i < activeViewerPlugins.size(); ++i)
-        {
-            item = activeViewerPlugins.at(i);
-            item->updateFileStart();
-        }
-    }
+        const int previousCount = oldPerFileCount.value(fileIndex, 0);
+        const int currentCount = qfile.getFileMsgNumber(fileIndex);
 
-    for(IndexThreadBatchResultItem entry : result.items)
-    {
-        if(!entry.valid)
+        for(int localIndex = previousCount; localIndex < currentCount; ++localIndex)
         {
-            continue;
-        }
+            const int globalIndex = globalBaseIndex + localIndex;
 
-        if(result.pluginsEnabled)
-        {
-            for(int i = 0; i < activeViewerPlugins.size(); ++i)
+            QDltMsg undecodedMsg;
+            if(!undecodedMsg.setMsg(qfile.getMsg(globalIndex), true, settings->supportDLTv2Decoding))
             {
-                item = activeViewerPlugins.at(i);
-                item->updateMsg(entry.index, entry.undecodedMsg);
-                item->updateMsgDecoded(entry.index, entry.decodedMsg);
+                continue;
+            }
+
+            undecodedMsg.setIndex(globalIndex);
+            QDltMsg decodedMsg = undecodedMsg;
+            DecodeManager::instance().decode(&pluginManager, decodedMsg, pluginsEnabled, silentMode);
+
+            if(!filterEnabled || qfile.checkFilter(decodedMsg))
+            {
+                qfile.addFilterIndex(globalIndex);
+            }
+
+            if(pluginsEnabled)
+            {
+                if(!pluginUpdateStarted)
+                {
+                    for(int i = 0; i < activeViewerPlugins.size(); ++i)
+                    {
+                        plugin = activeViewerPlugins.at(i);
+                        plugin->updateFileStart();
+                    }
+                    pluginUpdateStarted = true;
+                }
+
+                for(int i = 0; i < activeViewerPlugins.size(); ++i)
+                {
+                    plugin = activeViewerPlugins.at(i);
+                    plugin->updateMsg(globalIndex, undecodedMsg);
+                    plugin->updateMsgDecoded(globalIndex, decodedMsg);
+                }
             }
         }
+
+        globalBaseIndex += currentCount;
     }
 
-    if(result.pluginsEnabled)
+    if(pluginUpdateStarted)
     {
         for(int i = 0; i < activeViewerPlugins.size(); ++i)
         {
-            item = activeViewerPlugins.at(i);
-            item->updateFileFinish();
-        }
-    }
-}
-
-void MainWindow::onIndexBatchProcessed(const IndexThreadBatchResult &result)
-{
-    const int oldVisibleRowCount = tableModel ? tableModel->rowCount() : 0;
-    processIndexBatchResult(result);
-
-    const int newVisibleRowCount = tableModel ? tableModel->rowCount() : 0;
-    if(newVisibleRowCount > oldVisibleRowCount)
-    {
-        postBatchUpdateEvent(oldVisibleRowCount, newVisibleRowCount - 1);
-    }
-    else
-    {
-        postBatchUpdateEvent(-1, -1);
-    }
-
-    m_indexUpdateInFlight = false;
-    if(m_indexUpdatePending)
-    {
-        m_indexUpdatePending = false;
-        updateIndex();
-    }
-}
-
-void MainWindow::postBatchUpdateEvent(int firstRow, int lastRow)
-{
-    m_pendingLiveUpdateCount += (firstRow >= 0 && lastRow >= firstRow)
-        ? (lastRow - firstRow + 1)
-        : 1;
-
-    if(firstRow >= 0 && lastRow >= firstRow)
-    {
-        if(m_pendingBatchFirstRow < 0)
-        {
-            m_pendingBatchFirstRow = firstRow;
-            m_pendingBatchLastRow = lastRow;
-        }
-        else
-        {
-            m_pendingBatchFirstRow = qMin(m_pendingBatchFirstRow, firstRow);
-            m_pendingBatchLastRow = qMax(m_pendingBatchLastRow, lastRow);
+            plugin = activeViewerPlugins.at(i);
+            plugin->updateFileFinish();
         }
     }
 
-    if(m_batchUpdateEventPosted)
-    {
-        return;
-    }
-
-    if(m_pendingLiveUpdateCount >= LiveUpdateBatchMaxEvents)
-    {
-        m_liveBatchUpdateTimer.stop();
-        flushPendingBatchUpdateEvent();
-        return;
-    }
-
-    if(!m_liveBatchUpdateTimer.isActive())
-    {
-        m_liveBatchUpdateTimer.start(LiveUpdateBatchIntervalMs);
-    }
-}
-
-void MainWindow::flushPendingBatchUpdateEvent()
-{
-    if(m_batchUpdateEventPosted || m_pendingLiveUpdateCount <= 0)
-    {
-        return;
-    }
-
-    m_batchUpdateEventPosted = true;
-    QCoreApplication::postEvent(this, new BatchUpdateEvent(m_pendingBatchFirstRow, m_pendingBatchLastRow));
-}
-
-void MainWindow::handleBatchUpdateEvent(int firstRow, int lastRow)
-{
     statusByteErrorsReceived->setText(QString("Recv Errors: %L1").arg(totalByteErrorsRcvd));
     statusBytesReceived->setText(QString("Recv: %L1").arg(totalBytesRcvd));
     statusSyncFoundReceived->setText(QString("Sync found: %L1").arg(totalSyncFoundRcvd));
 
-    if(firstRow >= 0 && lastRow >= firstRow && tableModel)
+    const int newVisibleRowCount = tableModel ? tableModel->rowCount() : 0;
+    if(newVisibleRowCount > oldVisibleRowCount && tableModel)
     {
-        tableModel->appendRows(firstRow, lastRow);
+        tableModel->appendRows(oldVisibleRowCount, newVisibleRowCount - 1);
 
         if(settings->autoScroll)
         {
             ui->tableView->scrollToBottom();
         }
     }
-}
-
-bool MainWindow::event(QEvent *event)
-{
-    if(event->type() == BatchUpdateEventType)
-    {
-        const BatchUpdateEvent *batchEvent = static_cast<const BatchUpdateEvent *>(event);
-        const int firstRow = m_pendingBatchFirstRow >= 0 ? m_pendingBatchFirstRow : batchEvent->firstRow();
-        const int lastRow = m_pendingBatchLastRow >= 0 ? m_pendingBatchLastRow : batchEvent->lastRow();
-
-        m_liveBatchUpdateTimer.stop();
-        m_batchUpdateEventPosted = false;
-        m_pendingBatchFirstRow = -1;
-        m_pendingBatchLastRow = -1;
-        m_pendingLiveUpdateCount = 0;
-
-        handleBatchUpdateEvent(firstRow, lastRow);
-        return true;
-    }
-
-    return QMainWindow::event(event);
 }
 
 void MainWindow::onTableViewSelectionChanged(const QItemSelection & selected, const QItemSelection & deselected)
