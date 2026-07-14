@@ -24,6 +24,7 @@
 #include "tablemodel.h"
 
 #include <dltmessagematcher.h>
+#include <QtConcurrent/QtConcurrent>
 
 #include <QApplication>
 #include <QMessageBox>
@@ -83,6 +84,14 @@ SearchDialog::SearchDialog(QWidget *parent) :
     // OK button triggers find next
     connect(this, &SearchDialog::accepted, this, &SearchDialog::findNextClicked);
 
+    // Find-All batch results are emitted from the worker thread; the queued connection
+    // ensures addToSearchIndexBatch runs on the UI thread.
+    connect(this, &SearchDialog::findAllBatchReady, this,
+            [this](QList<unsigned long> batch) {
+                addToSearchIndexBatch(batch);
+                maybeEmitFindAllRefresh();
+            }, Qt::QueuedConnection);
+
     fSilentMode = !QDltOptManager::getInstance()->issilentMode();
 
     updateColorbutton();
@@ -90,6 +99,10 @@ SearchDialog::SearchDialog(QWidget *parent) :
 
 SearchDialog::~SearchDialog()
 {
+    // Cancel and join any in-progress Find-All before releasing resources.
+    isSearchCancelled.store(true, std::memory_order_relaxed);
+    if (m_findAllFuture.isRunning())
+        m_findAllFuture.waitForFinished();
     clearCacheHistory();
     delete ui;
 }
@@ -253,6 +266,11 @@ void SearchDialog::focusRow(long int searchLine)
 
 int SearchDialog::find()
 {
+    // Cancel and join any previous async Find-All before starting a new search.
+    if (m_findAllFuture.isRunning()) {
+        isSearchCancelled.store(true, std::memory_order_relaxed);
+        m_findAllFuture.waitForFinished();
+    }
     isSearchCancelled.store(false, std::memory_order_relaxed);
 
     emit addActionHistory();
@@ -394,12 +412,52 @@ int SearchDialog::find()
 
     if (searchtoIndex() == true)
     {
-        findMessages(startLine, searchBorder, searchTextRegExpression);
-        emit refreshedSearchIndex();
-        cacheSearchHistory();
-        match = (m_searchtablemodel && m_searchtablemodel->get_SearchResultListSize() > 0);
-        emit searchProgressChanged(false);
-        return match ? 1 : 0;
+        m_findAllUiUpdateTimer.restart();
+        m_findAllLastUiUpdateMs = 0;
+        m_findAllAddedSinceLastUiUpdate = 0;
+
+        // Build the matcher on the UI thread before handing off to the worker.
+        const Qt::CaseSensitivity caseSens = getCaseSensitive() ? Qt::CaseSensitive : Qt::CaseInsensitive;
+        DltMessageMatcher capturedMatcher;
+        capturedMatcher.setCaseSentivity(caseSens);
+        capturedMatcher.setSearchAppId(stApid);
+        capturedMatcher.setSearchCtxId(stCtid);
+        if (ui->radioTimestamp->isChecked() && is_TimeStampSearchSelected)
+            capturedMatcher.setTimestampRange(dTimeStampStart, dTimeStampStop);
+        if (ui->radioTime->isChecked())
+            capturedMatcher.setTimeRange(ui->dateTimeStart->dateTime(), ui->dateTimeEnd->dateTime());
+        const bool msgIdEnabled = QDltSettingsManager::getInstance()->value("startup/showMsgId", true).toBool();
+        const QString msgIdFormat = QDltSettingsManager::getInstance()->value("startup/msgIdFormat", "0x%x").toString();
+        if (msgIdEnabled)
+            capturedMatcher.setMessageIdFormat(msgIdFormat);
+        capturedMatcher.setHeaderSearchEnabled(getHeader());
+        capturedMatcher.setPayloadSearchEnabled(getPayload());
+
+        DltMessageMatcher::Pattern capturedPattern = getRegExp()
+            ? DltMessageMatcher::Pattern(searchTextRegExpression)
+            : DltMessageMatcher::Pattern(getText());
+
+        m_searchtablemodel->clear_SearchResults();
+
+        ++m_findAllGeneration;
+        const int generation      = m_findAllGeneration;
+        const long int capSLine   = startLine;
+        const long int capSBorder = searchBorder;
+        const int capTotalRows    = totalRows;
+
+        m_findAllFuture = QtConcurrent::run(
+            [this, generation, capSLine, capSBorder, capTotalRows,
+             capturedPattern = std::move(capturedPattern),
+             capturedMatcher = std::move(capturedMatcher)]() mutable {
+                runFindAllWorker(capSLine, capSBorder, capTotalRows,
+                                 std::move(capturedPattern), std::move(capturedMatcher));
+                // Notify the UI thread when the worker is done.
+                QMetaObject::invokeMethod(this, [this, generation]() {
+                    onFindAllFinished(generation);
+                }, Qt::QueuedConnection);
+            });
+
+        return -1;  // async; UI update and colour setting happen in onFindAllFinished
     }
 
     findMessages(startLine,searchBorder,searchTextRegExpression);
@@ -454,14 +512,22 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
     if (msgIdEnabled) {
         matcher.setMessageIdFormat(msgIdFormat);
     }
-    matcher.setHeaderSearchEnabled(getHeader());
-    matcher.setPayloadSearchEnabled(getPayload());
+    const bool headerEnabled = getHeader();
+    const bool payloadEnabled = getPayload();
+    matcher.setHeaderSearchEnabled(headerEnabled);
+    matcher.setPayloadSearchEnabled(payloadEnabled);
+
+    const bool decodeEnabledSetting = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
+    const bool shouldDecodeForSearch = decodeEnabledSetting && payloadEnabled;
+    const DltMessageMatcher::Pattern searchPattern = getRegExp()
+        ? DltMessageMatcher::Pattern(searchTextRegExp)
+        : DltMessageMatcher::Pattern(getText());
 
     do
     {
         ctr++; // for file progress indication
 
-        if(getNextClicked() || searchtoIndex())
+        if(getNextClicked())
         {
             searchLine++;
             if(searchLine >= totalRows)
@@ -491,14 +557,35 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
         /* get the message with the selected item id */
         const int msgIndex = file->getMsgFilterPos(searchLine);
         buf = file->getMsg(msgIndex);
-        msg.setMsg(buf);
+        if(!msg.setMsg(buf))
+        {
+            continue;
+        }
         msg.setIndex(msgIndex);
 
-        /* decode the message if desired - could this call be avoided as the message is already decoded elsewhere ? */
-        const bool decodeEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
-        DecodeManager::instance().decode(pluginManager, msg, decodeEnabled, fSilentMode);
+        if(!matcher.matchMeta(msg))
+        {
+            match = false;
+            continue;
+        }
 
-        const bool matchFound = getRegExp() ? matcher.match(msg, searchTextRegExp) : matcher.match(msg, getText());
+        bool matchFound = false;
+        if(headerEnabled)
+        {
+            matchFound = matcher.matchHeader(msg, searchPattern);
+        }
+
+        if(!matchFound && payloadEnabled)
+        {
+            matchFound = matcher.matchPayload(msg, searchPattern);
+        }
+
+        if(!matchFound && shouldDecodeForSearch)
+        {
+            DecodeManager::instance().decode(pluginManager, msg, decodeEnabledSetting, fSilentMode);
+            matchFound = matcher.matchPayload(msg, searchPattern);
+        }
+
         if (!matchFound)
         {
             match = false;
@@ -507,10 +594,107 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
 
         if (foundLine(searchLine, static_cast<unsigned long>(msgIndex)))
             break;
-        else
-            continue;
     }
     while( searchBorder != searchLine );
+}
+
+void SearchDialog::runFindAllWorker(long int searchLine, long int searchBorder, int totalRows,
+                                    DltMessageMatcher::Pattern pattern, DltMessageMatcher matcher)
+{
+    // This method runs on a thread-pool thread.
+    // It does NOT call decode (no mutex contention) and does NOT call QApplication::processEvents().
+    QDltMsg msg;
+    QList<unsigned long> batch;
+    batch.reserve(512);
+    int ctr = 0;
+
+    // Raw-bytes prefilter setup.
+    // For plain-text payload-only searches, the search term appears verbatim (UTF-8) in the
+    // raw DLT wire bytes for string-type arguments.  Checking the raw bytes before calling the
+    // expensive setMsg() + toStringPayload() avoids ~60 µs of parsing per non-matching message.
+    // Note: numeric DLT arguments (int, float) are stored as binary, so a search for "42" will
+    // not be prefiltered — those messages fall through to full parsing as before.
+    QByteArray prefilterBytes;
+    QByteArray prefilterBytesLower;
+    bool usePrefilter = false;
+    if (!matcher.isHeaderSearchEnabled() &&
+         matcher.isPayloadSearchEnabled() &&
+         std::holds_alternative<QString>(pattern))
+    {
+        const QString& text = std::get<QString>(pattern);
+        if (!text.isEmpty()) {
+            prefilterBytes      = text.toUtf8();
+            prefilterBytesLower = prefilterBytes.toLower();
+            usePrefilter = true;
+        }
+    }
+    const bool caseSensitive = (matcher.caseSensitivity() == Qt::CaseSensitive);
+
+    do {
+        ctr++;
+        searchLine++;
+        if (searchLine >= totalRows)
+            searchLine = 0;
+
+        if (ctr % 1000 == 0) {
+            if (isSearchCancelled.load(std::memory_order_relaxed))
+                break;
+            emit searchProgressValueChanged(static_cast<int>(ctr * 100.0 / totalRows));
+        }
+
+        const int msgIndex = file->getMsgFilterPos(searchLine);
+        const QByteArray buf = file->getMsg(msgIndex);
+
+        // Apply raw-bytes prefilter before the expensive DLT parse.
+        if (usePrefilter) {
+            if (caseSensitive) {
+                if (!buf.contains(prefilterBytes))
+                    continue;
+            } else {
+                // toLower() + contains() is still ~20x cheaper than setMsg + toStringPayload.
+                if (!buf.toLower().contains(prefilterBytesLower))
+                    continue;
+            }
+        }
+
+        if (!msg.setMsg(buf))
+            continue;
+        msg.setIndex(msgIndex);
+
+        if (!matcher.matchMeta(msg))
+            continue;
+
+        const bool matchFound = matcher.matchHeader(msg, pattern) ||
+                                matcher.matchPayload(msg, pattern);
+        if (!matchFound)
+            continue;
+
+        batch.append(static_cast<unsigned long>(msgIndex));
+        if (batch.size() >= 512) {
+            emit findAllBatchReady(batch);
+            batch.clear();
+        }
+    } while (searchBorder != searchLine &&
+             !isSearchCancelled.load(std::memory_order_relaxed));
+
+    if (!batch.isEmpty())
+        emit findAllBatchReady(batch);
+}
+
+void SearchDialog::onFindAllFinished(int generation)
+{
+    // Guard against stale completions from a cancelled search.
+    if (generation != m_findAllGeneration)
+        return;
+
+    cacheSearchHistory();
+    match = (m_searchtablemodel && m_searchtablemodel->get_SearchResultListSize() > 0);
+    maybeEmitFindAllRefresh(true);
+    emit searchProgressChanged(false);
+
+    const int result = match ? 1 : 0;
+    for (int i = 0; i < lineEdits.size(); i++)
+        setSearchColour(lineEdits.at(i), result);
 }
 
 bool SearchDialog::foundLine(long int searchLine, unsigned long msgIndex)
@@ -536,18 +720,24 @@ void SearchDialog::findNextClicked()
 {
     setNextClicked(true);
 
-    int result = find();
-    for(int i=0; i<lineEdits.size();i++)
-        setSearchColour(lineEdits.at(i),result);
+    const int result = find();
+    if (result >= 0) {
+        for(int i=0; i<lineEdits.size();i++)
+            setSearchColour(lineEdits.at(i),result);
+    }
+    // result == -1 means async Find-All was launched; colour is set in onFindAllFinished.
 }
 
 void SearchDialog::findPreviousClicked()
 {
     setNextClicked(false);
 
-    int result = find();
-    for(int i=0; i<lineEdits.size();i++)
-        setSearchColour(lineEdits.at(i),result);
+    const int result = find();
+    if (result >= 0) {
+        for(int i=0; i<lineEdits.size();i++)
+            setSearchColour(lineEdits.at(i),result);
+    }
+    // result == -1 means async Find-All was launched; colour is set in onFindAllFinished.
 }
 
 void SearchDialog::on_lineEditSearch_textEdited(QString newText)
@@ -607,6 +797,44 @@ void SearchDialog::addToSearchIndex(unsigned long msgIndex)
     m_searchtablemodel->add_SearchResultEntry(msgIndex);
  }
 
+void SearchDialog::addToSearchIndexBatch(const QList<unsigned long> &msgIndices)
+{
+    if(msgIndices.isEmpty())
+    {
+        return;
+    }
+
+    m_searchtablemodel->add_SearchResultEntries(msgIndices);
+    m_findAllAddedSinceLastUiUpdate += msgIndices.size();
+}
+
+void SearchDialog::maybeEmitFindAllRefresh(bool force)
+{
+    if(!searchtoIndex())
+    {
+        return;
+    }
+
+    if(force)
+    {
+        m_findAllLastUiUpdateMs = m_findAllUiUpdateTimer.elapsed();
+        m_findAllAddedSinceLastUiUpdate = 0;
+        emit refreshedSearchIndex();
+        return;
+    }
+
+    const qint64 nowMs = m_findAllUiUpdateTimer.elapsed();
+    const bool timeToUpdate = (nowMs - m_findAllLastUiUpdateMs) >= 200;
+    const bool enoughItems = m_findAllAddedSinceLastUiUpdate >= 1000;
+
+    if(timeToUpdate || enoughItems)
+    {
+        m_findAllLastUiUpdateMs = nowMs;
+        m_findAllAddedSinceLastUiUpdate = 0;
+        emit refreshedSearchIndex();
+    }
+}
+
 void SearchDialog::registerSearchTableModel(SearchTableModel *model)
 {
     m_searchtablemodel = model;    
@@ -631,10 +859,7 @@ void SearchDialog::loadSearchHistory()
 
         //deleting the previous search list and adding the cached search obtained to the model.
         m_searchtablemodel->clear_SearchResults();
-        for (int i = 0;i < tmp.size();i++)
-        {
-            m_searchtablemodel->add_SearchResultEntry(tmp.at(i));
-        }
+        m_searchtablemodel->add_SearchResultEntries(tmp);
     }
     emit refreshedSearchIndex();
 }

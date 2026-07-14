@@ -24,6 +24,8 @@
 #include <QCheckBox>
 #include <QColor>
 #include <QDateTime>
+#include <QElapsedTimer>
+#include <QFuture>
 #include <QHash>
 #include <QLineEdit>
 #include <QRegularExpression>
@@ -33,6 +35,7 @@
 #include <atomic>
 
 #include "searchtablemodel.h"
+#include <dltmessagematcher.h>
 
 namespace Ui {
 class SearchDialog;
@@ -124,6 +127,11 @@ private:
     SearchTableModel *m_searchtablemodel{nullptr};
 
     std::atomic_bool isSearchCancelled{false};
+    QElapsedTimer m_findAllUiUpdateTimer;
+    qint64 m_findAllLastUiUpdateMs{0};
+    int m_findAllAddedSinceLastUiUpdate{0};
+    QFuture<void> m_findAllFuture;
+    int m_findAllGeneration{0};
 
     long int startLine{-1};
     bool nextClicked{true};
@@ -152,6 +160,8 @@ private:
       * @param msgIndex Message index in the DLT file.
      */
     void addToSearchIndex(unsigned long msgIndex);
+    void addToSearchIndexBatch(const QList<unsigned long> &msgIndices);
+    void maybeEmitFindAllRefresh(bool force = false);
     /**
      * @brief Iterates through messages and finds matches.
      * @param searchLine Start line.
@@ -159,6 +169,9 @@ private:
      * @param searchTextRegExp Regular expression for search.
      */
     void findMessages(long int searchLine, long int searchBorder, QRegularExpression &searchTextRegExp);
+    void runFindAllWorker(long int searchLine, long int searchBorder, int totalRows,
+                          DltMessageMatcher::Pattern pattern, DltMessageMatcher matcher);
+    void onFindAllFinished(int generation);
     /**
      * @brief Updates the color button icon.
      */
@@ -327,6 +340,7 @@ signals:
     void addActionHistory();
     void searchProgressChanged(bool isInProgress);
     void searchProgressValueChanged(int progress);
+    void findAllBatchReady(QList<unsigned long> batch);
 };
 
 #endif // SEARCHDIALOG_H

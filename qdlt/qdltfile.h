@@ -421,6 +421,7 @@ private:
     quint64 totalStorageSize = 0;
     quint64 totalMessageSize = 0;
     quint64 totalPayloadSize = 0;
+    bool totalSizesDirty = true;
 
     //! DLTv2 Support.
     /*!

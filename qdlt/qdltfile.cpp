@@ -104,6 +104,7 @@ void QDltFile::setDltIndex(QVector<qint64> &_indexAll, int num)
     }
 
     files[num]->indexAll = _indexAll;
+    totalSizesDirty = true;
 }
 
 int QDltFile::size() const
@@ -187,10 +188,11 @@ bool QDltFile::open(QString _filename, bool append)
     /* check if file is already opened */
     if(!append) {
         clear();
-        // Reset size counters when opening new file
-        totalStorageSize = 0;
-        totalPayloadSize = 0;
-        totalMessageSize = 0;
+        totalSizesDirty = true;
+    }
+    else
+    {
+        totalSizesDirty = true;
     }
 
     /* create new file item */
@@ -212,21 +214,21 @@ bool QDltFile::open(QString _filename, bool append)
 }
 
 quint64 QDltFile::getTotalStorageSize() { 
-    if (totalStorageSize == 0 && size() > 0) {
+    if (totalSizesDirty) {
         calculateTotalSizes();
     }
     return totalStorageSize; 
 }
 
 quint64 QDltFile::getTotalPayloadSize() { 
-    if (totalPayloadSize == 0 && size() > 0) {
+    if (totalSizesDirty) {
         calculateTotalSizes();
     }
     return totalPayloadSize; 
 }
 
 quint64 QDltFile::getTotalMessageSize() { 
-    if (totalMessageSize == 0 && size() > 0) {
+    if (totalSizesDirty) {
         calculateTotalSizes();
     }
     return totalMessageSize; 
@@ -239,10 +241,7 @@ void QDltFile::clearIndex()
         files[num]->indexAll.clear();
     }
     
-    // Reset size counters when clearing index
-    totalStorageSize = 0;
-    totalPayloadSize = 0;
-    totalMessageSize = 0;
+    totalSizesDirty = true;
 }
 
 bool QDltFile::createIndex()
@@ -596,19 +595,11 @@ void QDltFile::addFilterIndices(const QVector<qint64> &indices)
         return;
     }
 
-    indexFilterBase.reserve(indexFilterBase.size() + indices.size());
-    for(const qint64 idx : indices)
-    {
-        indexFilterBase.append(idx);
-    }
+    indexFilterBase += indices;
 
     if(manualMarkerIndices.isEmpty())
     {
-        indexFilter.reserve(indexFilter.size() + indices.size());
-        for(const qint64 idx : indices)
-        {
-            indexFilter.append(idx);
-        }
+        indexFilter += indices;
         return;
     }
 
@@ -678,25 +669,18 @@ void QDltFile::appendDltIndices(const QVector<qint64> &indices, int num)
         return;
     }
 
-    files[num]->indexAll.reserve(files[num]->indexAll.size() + indices.size());
-    for(const qint64 idx : indices)
-    {
-        files[num]->indexAll.append(idx);
-    }
-
-    totalStorageSize = 0;
-    totalPayloadSize = 0;
-    totalMessageSize = 0;
+    files[num]->indexAll += indices;
+    totalSizesDirty = true;
 }
 
 void QDltFile::close()
 {
     /* close file */
     clear();
-    // Reset size counters when closing
     totalPayloadSize = 0;
     totalMessageSize = 0;
     totalStorageSize = 0;
+    totalSizesDirty = false;
 }
 
 QByteArray QDltFile::getMsg(int index) const
@@ -1071,6 +1055,7 @@ void QDltFile::calculateTotalSizes()
         totalStorageSize = 0;
         totalMessageSize = 0;
         totalPayloadSize = 0;
+        totalSizesDirty = false;
         return;
     }
 
@@ -1153,4 +1138,6 @@ void QDltFile::calculateTotalSizes()
         totalMessageSize += msgSizeCache[i].messageSize;
         totalPayloadSize += msgSizeCache[i].payloadSize;
     }
+
+    totalSizesDirty = false;
 }

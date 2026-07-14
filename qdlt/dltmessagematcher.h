@@ -51,6 +51,13 @@ public:
         m_messageIdFormat = msgIdFormat;
     }
 
+    bool isHeaderSearchEnabled()  const { return m_headerSearchEnabled; }
+    bool isPayloadSearchEnabled() const { return m_payloadSearchEnabled; }
+    Qt::CaseSensitivity caseSensitivity() const { return m_caseSensitivity; }
+
+    bool matchMeta(const QDltMsg& message) const;
+    bool matchHeader(const QDltMsg& message, const Pattern& pattern) const;
+    bool matchPayload(const QDltMsg& message, const Pattern& pattern) const;
     bool match(const QDltMsg& message, const Pattern& pattern) const;
 private:
     bool matchAppId(const QString& appId) const;

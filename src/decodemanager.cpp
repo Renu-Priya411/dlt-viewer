@@ -2,8 +2,6 @@
 
 #include "qdltpluginmanager.h"
 
-#include <QMutexLocker>
-
 DecodeManager &DecodeManager::instance()
 {
     static DecodeManager manager;
@@ -17,6 +15,5 @@ void DecodeManager::decode(QDltPluginManager *pluginManager, QDltMsg &msg, bool 
         return;
     }
 
-    QMutexLocker lock(&m_mutex);
     pluginManager->decodeMsg(msg, silentMode);
 }

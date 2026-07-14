@@ -1,7 +1,7 @@
 #ifndef DECODEMANAGER_H
 #define DECODEMANAGER_H
 
-#include <QMutex>
+#include <QtGlobal>
 
 class QDltPluginManager;
 class QDltMsg;
@@ -30,8 +30,6 @@ public:
 private:
     DecodeManager() = default;
     Q_DISABLE_COPY(DecodeManager)
-
-    QMutex m_mutex;
 };
 
 #endif // DECODEMANAGER_H
