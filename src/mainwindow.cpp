@@ -53,6 +53,7 @@
 #include <QtEndian>
 #include <QDir>
 #include <QDirIterator>
+#include <QCoreApplication>
 #include <QThread>
 #include <QTableWidget>
 #include <QToolButton>
@@ -86,6 +87,21 @@
 #include "ecutree.h"
 #include "updatechecker.h"
 #include "filespliting.h"
+#include "decodemanager.h"
+#include "indexthreadworker.h"
+
+namespace {
+constexpr int kLiveBatchUpdateEventType = QEvent::User + 101;
+
+class LiveBatchUpdateEvent final : public QEvent
+{
+public:
+    LiveBatchUpdateEvent()
+        : QEvent(static_cast<QEvent::Type>(kLiveBatchUpdateEventType))
+    {
+    }
+};
+}
 
 
 MainWindow::MainWindow(QWidget *parent) :
@@ -99,6 +115,12 @@ MainWindow::MainWindow(QWidget *parent) :
 {
 
     dltIndexer = NULL;
+    liveIndexWorker = nullptr;
+    decodeManager = nullptr;
+    liveBatchPendingEvents = 0;
+    liveBatchPendingMatches = 0;
+    liveDisplayedRowCount = 0;
+    liveBatchEventQueued = false;
     settings = QDltSettingsManager::getInstance();
     ui->setupUi(this);
     ui->enableConfigFrame->setVisible(false);
@@ -277,6 +299,11 @@ MainWindow::~MainWindow()
 {
     timer.stop(); // stop the receive timeout timer in case it is running
     dltIndexer->stop(); // in case a thread is running we want to stop it
+    if(liveIndexWorker != nullptr)
+    {
+        liveIndexWorker->requestStop();
+        liveIndexWorker->wait();
+    }
     /**
      * All plugin dockwidgets must be removed from the layout manually and
      * then deleted. This has to be done here, because they contain
@@ -336,6 +363,7 @@ MainWindow::~MainWindow()
     delete tableModel;
     delete searchDlg;
     delete dltIndexer;
+    delete decodeManager;
     delete m_shortcut_searchnext;
     delete m_shortcut_searchprev;
     delete crlfFilterWindow;
@@ -817,6 +845,20 @@ void MainWindow::initFileHandling()
     connect(dltIndexer, SIGNAL(unregisterContext(QString,QString,QString)), this, SLOT(controlMessage_UnregisterContext(QString,QString,QString)));
     connect(dltIndexer, SIGNAL(finished()), this, SLOT(indexDone()));
     connect(dltIndexer, SIGNAL(started()), this, SLOT(indexStart()));
+
+    decodeManager = new DecodeManager(&pluginManager);
+    liveIndexWorker = new IndexThreadWorker(&qfile, &pluginManager, decodeManager, this);
+    connect(liveIndexWorker, SIGNAL(indexBatchStarted()), this, SLOT(onLiveIndexBatchStarted()));
+    connect(liveIndexWorker, SIGNAL(indexBatchFinished()), this, SLOT(onLiveIndexBatchFinished()));
+    connect(liveIndexWorker, SIGNAL(filterDecision(int,bool,QString)), this, SLOT(onLiveIndexDecision(int,bool,QString)));
+    connect(liveIndexWorker, SIGNAL(versionStringFound(QString,QString)), this, SLOT(reloadLogFileVersionString(QString,QString)));
+    connect(liveIndexWorker, SIGNAL(timezoneFound(int,unsigned char)), this, SLOT(controlMessage_Timezone(int,unsigned char)));
+    connect(liveIndexWorker, SIGNAL(unregisterContextFound(QString,QString,QString)), this, SLOT(controlMessage_UnregisterContext(QString,QString,QString)));
+    liveIndexWorker->setPriority(QThread::NormalPriority);
+    liveIndexWorker->start();
+
+    liveBatchTimer.setSingleShot(true);
+    connect(&liveBatchTimer, &QTimer::timeout, this, &MainWindow::postLiveBatchUpdateEvent);
 
     /* Plugins/Filters enabled state (toolbar is the UI) */
     pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
@@ -2596,6 +2638,8 @@ void MainWindow::reloadLogFileFinishIndex()
     if (settings->autoScroll) {
         ui->tableView->scrollToBottom();
     }
+
+    liveDisplayedRowCount = qfile.sizeFilter();
 }
 
 void MainWindow::reloadLogFileFinishFilter()
@@ -2662,6 +2706,8 @@ void MainWindow::reloadLogFileFinishFilter()
     // hide progress bar when finished
     statusProgressBar->reset();
     statusProgressBar->hide();
+
+    liveDisplayedRowCount = qfile.sizeFilter();
 }
 
 void MainWindow::reloadLogFileFinishDefaultFilter()
@@ -2674,6 +2720,14 @@ void MainWindow::reloadLogFileFinishDefaultFilter()
 void MainWindow::reloadLogFile(bool update, bool multithreaded)
 {
     qint64 fileerrors = 0;
+
+    // Reset pending live-batch UI updates before reloading/filtering to avoid
+    // stale insert ranges against a temporarily force-empty model.
+    liveBatchTimer.stop();
+    liveBatchPendingEvents = 0;
+    liveBatchPendingMatches = 0;
+    liveBatchEventQueued = false;
+
     /* check if in logging only mode, then do not create index */
     tableModel->setLoggingOnlyMode(settings->loggingOnlyMode);
     tableModel->modelChanged();
@@ -4095,16 +4149,16 @@ void MainWindow::connectAll()
         connectECU(ecuitem);
     }
 
-    // periodically update table view to account for the new incoming messages
-    const int drawInterval = (settings->RefreshRate > 0) ? 1000 / settings->RefreshRate
-                                                         : 1000 / DEFAULT_REFRESH_RATE;
-    drawTimer.start(drawInterval);
-    connect(&drawTimer, &QTimer::timeout, this, &MainWindow::drawUpdatedView);
+    liveBatchPendingEvents = 0;
+    liveBatchPendingMatches = 0;
+    liveDisplayedRowCount = qfile.sizeFilter();
+    liveBatchEventQueued = false;
 }
 
 void MainWindow::disconnectAll()
 {
-    drawTimer.stop();
+    liveBatchTimer.stop();
+    applyLiveBatchUpdate();
     for(int num = 0; num < project.ecu->topLevelItemCount (); num++)
     {
         EcuItem *ecuitem = (EcuItem*)project.ecu->topLevelItem(num);
@@ -4863,7 +4917,7 @@ void MainWindow::read(EcuItem* ecuitem)
      //   {
             if(false == dltIndexer->isRunning())
             {
-                updateIndex();
+                updateIndexLiveAsync();
             }
      //   }
 }
@@ -5016,13 +5070,154 @@ void MainWindow::updateIndex()
     }
 }
 
+void MainWindow::updateIndexLiveAsync()
+{
+    if(liveIndexWorker == nullptr)
+    {
+        updateIndex();
+        return;
+    }
+
+    liveIndexWorker->setRuntimeConfig(
+        qfile.getFilterList(),
+        filtersEnabled,
+        pluginsEnabled,
+        !QDltOptManager::getInstance()->issilentMode());
+
+    liveIndexWorker->enqueueIndexUpdateRequest();
+}
+
+void MainWindow::onLiveIndexBatchStarted()
+{
+    if(!pluginsEnabled)
+    {
+        return;
+    }
+
+    const QList<QDltPlugin*> activeViewerPlugins = pluginManager.getViewerPlugins();
+    for(int i = 0; i < activeViewerPlugins.size(); ++i)
+    {
+        QDltPlugin *item = activeViewerPlugins.at(i);
+        if(item != nullptr)
+        {
+            item->updateFileStart();
+        }
+    }
+}
+
+void MainWindow::onLiveIndexBatchFinished()
+{
+    if(pluginsEnabled)
+    {
+        const QList<QDltPlugin*> activeViewerPlugins = pluginManager.getViewerPlugins();
+        for(int i = 0; i < activeViewerPlugins.size(); ++i)
+        {
+            QDltPlugin *item = activeViewerPlugins.at(i);
+            if(item != nullptr)
+            {
+                item->updateFileFinish();
+            }
+        }
+    }
+
+    postLiveBatchUpdateEvent();
+}
+
+void MainWindow::onLiveIndexDecision(int index, bool matched, QString markerFilterName)
+{
+    if(matched)
+    {
+        if(!markerFilterName.isEmpty())
+        {
+            dltIndexer->addMarkerCount(markerFilterName);
+        }
+        qfile.addFilterIndex(index);
+        ++liveBatchPendingMatches;
+    }
+
+    ++liveBatchPendingEvents;
+
+    if(liveBatchPendingEvents >= 1000)
+    {
+        postLiveBatchUpdateEvent();
+        return;
+    }
+
+    if(!liveBatchTimer.isActive())
+    {
+        liveBatchTimer.start(100);
+    }
+}
+
+void MainWindow::postLiveBatchUpdateEvent()
+{
+    if(liveBatchEventQueued)
+    {
+        return;
+    }
+
+    liveBatchEventQueued = true;
+    QCoreApplication::postEvent(this, new LiveBatchUpdateEvent());
+}
+
+void MainWindow::applyLiveBatchUpdate()
+{
+    liveBatchEventQueued = false;
+
+    if(liveBatchPendingEvents <= 0 && liveBatchPendingMatches <= 0)
+    {
+        return;
+    }
+
+    if(tableModel->isForceEmpty())
+    {
+        // Model is intentionally empty during reload/filter apply.
+        // Skip row insert/remove notifications until the model is restored.
+        liveDisplayedRowCount = qfile.sizeFilter();
+        liveBatchPendingEvents = 0;
+        liveBatchPendingMatches = 0;
+        return;
+    }
+
+    const int newRowCount = qfile.sizeFilter();
+    if(newRowCount != liveDisplayedRowCount)
+    {
+        // Backing row count can change concurrently while live indexing is running.
+        // Use a full model refresh here instead of beginInsertRows() to avoid
+        // transient invalid row ranges during apply/disable filter transitions.
+        tableModel->modelChanged();
+    }
+
+    liveDisplayedRowCount = newRowCount;
+
+    statusByteErrorsReceived->setText(QString("Recv Errors: %L1").arg(totalByteErrorsRcvd));
+    statusBytesReceived->setText(QString("Recv: %L1").arg(totalBytesRcvd));
+    statusSyncFoundReceived->setText(QString("Sync found: %L1").arg(totalSyncFoundRcvd));
+
+    if(settings->autoScroll) {
+        ui->tableView->scrollToBottom();
+    }
+
+    liveBatchPendingEvents = 0;
+    liveBatchPendingMatches = 0;
+}
+
+bool MainWindow::event(QEvent *event)
+{
+    if(event != nullptr && event->type() == static_cast<QEvent::Type>(kLiveBatchUpdateEventType))
+    {
+        applyLiveBatchUpdate();
+        return true;
+    }
+
+    return QMainWindow::event(event);
+}
+
 void MainWindow::drawUpdatedView()
 {
     statusByteErrorsReceived->setText(QString("Recv Errors: %L1").arg(totalByteErrorsRcvd));
     statusBytesReceived->setText(QString("Recv: %L1").arg(totalBytesRcvd));
     statusSyncFoundReceived->setText(QString("Sync found: %L1").arg(totalSyncFoundRcvd));
-
-    tableModel->modelChanged();
 
     //Line below would resize the payload column automatically so that the whole content is readable
     //ui->tableView->resizeColumnToContents(11); //Column 11 is the payload column

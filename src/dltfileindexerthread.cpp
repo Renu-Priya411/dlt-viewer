@@ -13,6 +13,7 @@ DltFileIndexerThread::DltFileIndexerThread
         QMap<DltFileIndexerKey,qint64> *indexFilterListSorted,
         QDltPluginManager *pluginManager,
         QList<QDltPlugin*> *activeViewerPlugins,
+        QList<QDltPlugin*> *activeDecoderPlugins,
         bool silentMode
 )
     :indexer(indexer),
@@ -23,6 +24,7 @@ DltFileIndexerThread::DltFileIndexerThread
       indexFilterListSorted(indexFilterListSorted),
       pluginManager(pluginManager),
       activeViewerPlugins(activeViewerPlugins),
+    activeDecoderPlugins(activeDecoderPlugins),
       silentMode(silentMode), msgQueue(1024)
 {
 
@@ -50,7 +52,8 @@ void DltFileIndexerThread::run()
         processMessage(msgPair.first, msgPair.second);
 }
 
-void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int index)
+
+void DltFileIndexerThread::processMessage(QDltMsg &msg, int index)
 {
     DltFileIndexer::IndexingMode mode = indexer->getMode();
     bool pluginsEnabled = indexer->getPluginsEnabled();
@@ -60,30 +63,30 @@ void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int inde
     /* check if it is a version messages and
     version string not already parsed */
     if((mode == DltFileIndexer::modeIndexAndFilter) &&
-       msg->getType() == QDltMsg::DltTypeControl &&
-       msg->getSubtype() == QDltMsg::DltControlResponse &&
-       msg->getCtrlServiceId() == DLT_SERVICE_ID_GET_SOFTWARE_VERSION)
+       msg.getType() == QDltMsg::DltTypeControl &&
+       msg.getSubtype() == QDltMsg::DltControlResponse &&
+       msg.getCtrlServiceId() == DLT_SERVICE_ID_GET_SOFTWARE_VERSION)
     {
-        QByteArray payload = msg->getPayload();
+        QByteArray payload = msg.getPayload();
         QByteArray data = payload.mid(9, (payload.size() > 262) ? 256 : (payload.size() - 9));
         QString version = QDlt::toAscii(data,true);
         version = version.trimmed(); // remove all white spaces at beginning and end
-        indexer->versionString(msg->getEcuid(),version);
+        indexer->versionString(msg.getEcuid(),version);
     }
 
     /* check if it is a timezone message */
     if((mode == DltFileIndexer::modeIndexAndFilter) &&
-       msg->getType() == QDltMsg::DltTypeControl &&
-       msg->getSubtype() == QDltMsg::DltControlResponse &&
-       msg->getCtrlServiceId() == DLT_SERVICE_ID_TIMEZONE)
+       msg.getType() == QDltMsg::DltTypeControl &&
+       msg.getSubtype() == QDltMsg::DltControlResponse &&
+       msg.getCtrlServiceId() == DLT_SERVICE_ID_TIMEZONE)
     {
-        QByteArray payload = msg->getPayload();
+        QByteArray payload = msg.getPayload();
         if(payload.size() == sizeof(DltServiceTimezone))
         {
             DltServiceTimezone *service;
             service = (DltServiceTimezone*) payload.constData();
 
-            if(msg->getEndianness() == QDlt::DltEndiannessLittleEndian)
+            if(msg.getEndianness() == QDlt::DltEndiannessLittleEndian)
                 indexer->timezone(service->timezone, service->isdst);
             else
                 indexer->timezone(DLT_SWAP_32(service->timezone), service->isdst);
@@ -92,17 +95,17 @@ void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int inde
 
     /* check if it is a timezone message */
     if((mode == DltFileIndexer::modeIndexAndFilter) &&
-       msg->getType()==QDltMsg::DltTypeControl &&
-       msg->getSubtype()==QDltMsg::DltControlResponse &&
-       msg->getCtrlServiceId() == DLT_SERVICE_ID_UNREGISTER_CONTEXT)
+       msg.getType()==QDltMsg::DltTypeControl &&
+       msg.getSubtype()==QDltMsg::DltControlResponse &&
+       msg.getCtrlServiceId() == DLT_SERVICE_ID_UNREGISTER_CONTEXT)
     {
-        QByteArray payload = msg->getPayload();
+        QByteArray payload = msg.getPayload();
         if(payload.size() == sizeof(DltServiceUnregisterContext))
         {
             DltServiceUnregisterContext *service;
             service = (DltServiceUnregisterContext *) payload.constData();
 
-            indexer->unregisterContext(msg->getEcuid(), QDltMsg::getStringFromId(service->apid), QDltMsg::getStringFromId(service->ctid));
+            indexer->unregisterContext(msg.getEcuid(), QDltMsg::getStringFromId(service->apid), QDltMsg::getStringFromId(service->ctid));
         }
     }
 
@@ -112,32 +115,38 @@ void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int inde
         for(int ivp = 0; ivp < activeViewerPlugins->size(); ivp++)
         {
             item = (QDltPlugin *) activeViewerPlugins->at(ivp);
-            item->initMsg(index, *msg);
+            item->initMsg(index, msg);
         }
     }
 
-    /* Process all decoderplugins */
-    if ( pluginsEnabled == true )
-     {
-     (void) pluginManager->decodeMsg(*msg, silentMode);
-     }
+    /* Process all decoderplugins using pre-snapshotted list to avoid lock contention in hot path */
+    if(pluginsEnabled && activeDecoderPlugins != nullptr)
+    {
+        for(int idp = 0; idp < activeDecoderPlugins->size(); ++idp)
+        {
+            QDltPlugin *decoder = activeDecoderPlugins->at(idp);
+            if(decoder != nullptr && decoder->decodeMsg(msg, silentMode))
+            {
+                break;
+            }
+        }
+    }
 
-
-    bool_result = filterList->checkFilter(*msg);
+    bool_result = filterList->checkFilter(msg);
     if ( bool_result == true)
     {
-        if(const QDltFilter *markerFilter = filterList->matchMarkerFilter(*msg); markerFilter != nullptr)
+        if(const QDltFilter *markerFilter = filterList->matchMarkerFilter(msg); markerFilter != nullptr)
         {
             indexer->addMarkerCount(markerFilter->name);
         }
 
         if(sortByTimeEnabled)
          {
-            indexFilterListSorted->insert(DltFileIndexerKey(msg->getTime(), msg->getMicroseconds(), index), index);
+            indexFilterListSorted->insert(DltFileIndexerKey(msg.getTime(), msg.getMicroseconds(), index), index);
          }
         else if(sortByTimestampEnabled)
          {
-            indexFilterListSorted->insert(DltFileIndexerKey(msg->getTimestamp(), index), index);
+            indexFilterListSorted->insert(DltFileIndexerKey(msg.getTimestamp(), index), index);
          }
         else
          {
@@ -151,28 +160,37 @@ void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int inde
         for(int ivp = 0; ivp < activeViewerPlugins->size(); ivp++)
         {
             item = (QDltPlugin *) activeViewerPlugins->at(ivp);
-            item->initMsgDecoded(index, *msg);
+            item->initMsgDecoded(index, msg);
         }
     }
 
     /* update context configuration when loading file */
     if((mode == DltFileIndexer::modeIndexAndFilter) &&
-        msg->getType() == QDltMsg::DltTypeControl &&
-        msg->getSubtype() == QDltMsg::DltControlResponse)
+        msg.getType() == QDltMsg::DltTypeControl &&
+        msg.getSubtype() == QDltMsg::DltControlResponse)
     {
         const char *ptr;
         int32_t length;
         uint32_t service_id=0, service_id_tmp=0;
 
-        QByteArray payload = msg->getPayload();
+        QByteArray payload = msg.getPayload();
         ptr = payload.constData();
         length = payload.size();
         DLT_MSG_READ_VALUE(service_id_tmp,ptr, length, uint32_t);
-        service_id=DLT_ENDIAN_GET_32(((msg->getEndianness() == QDlt::DltEndiannessBigEndian) ? DLT_HTYP_MSBF:0), service_id_tmp);
+        service_id=DLT_ENDIAN_GET_32(((msg.getEndianness() == QDlt::DltEndiannessBigEndian) ? DLT_HTYP_MSBF:0), service_id_tmp);
 
         if(service_id == DLT_SERVICE_ID_GET_LOG_INFO)
         {
             indexer->appendToGetLogInfoList(index);
         }
     }
+}
+
+void DltFileIndexerThread::processMessage(QSharedPointer<QDltMsg> &msg, int index)
+{
+    if(msg.isNull())
+    {
+        return;
+    }
+    processMessage(*msg, index);
 }

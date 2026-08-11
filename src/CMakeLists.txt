@@ -74,6 +74,10 @@ add_executable(dlt-viewer
     dltfileindexerthread.cpp
     dltfileindexerdefaultfilterthread.h
     dltfileindexerdefaultfilterthread.cpp
+    decodemanager.h
+    decodemanager.cpp
+    indexthreadworker.h
+    indexthreadworker.cpp
     sortfilterproxymodel.h
     sortfilterproxymodel.cpp
     searchform.h

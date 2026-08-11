@@ -382,7 +382,8 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
         return false;
     }
 
-    QSharedPointer<QDltMsg> msg;
+    QDltMsg msg;
+    QByteArray msgBuffer;
     QDltFilterList filterList;
     quint64 ix = 0;
     unsigned int iPercent = 0;
@@ -416,6 +417,11 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
             start=end;
     }
 
+    if(!sortByTimeEnabled && !sortByTimestampEnabled && end > start)
+    {
+        indexFilterList.reserve(static_cast<qsizetype>(end - start));
+    }
+
     // load filter index, if enabled and not an initial loading of file
     if(filterCacheEnabled && mode != modeIndexAndFilter && loadFilterIndexCache(filterList,indexFilterList,filenames))
     {
@@ -441,10 +447,7 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
     // get silent mode
     bool silentMode = !QDltOptManager::getInstance()->issilentMode();
 
-    //bool hasPlugins = (activeDecoderPlugins.size() + activeViewerPlugins.size()) > 0;
-    //bool hasFilters = filterList.filters.size() > 0;
-
-    //bool useIndexerThread = hasPlugins || hasFilters;
+    const bool useIndexerThread = false;
 
     DltFileIndexerThread indexerThread
             (
@@ -456,13 +459,14 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
                 &indexFilterListSorted,
                 pluginManager,
                 &activeViewerPlugins,
+                &activeDecoderPlugins,
                 silentMode
             );
 
-    /*if(useIndexerThread)
+    if(useIndexerThread)
     {
         indexerThread.start(); // thread starts reading its queue
-    }*/
+    }
 
     qDebug() << "### Create filter index";
     qDebug() << "Create filter index: Start";
@@ -474,19 +478,18 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
     // Start reading messages
     for(ix=start;ix<end;ix++)
     {
-        msg = QSharedPointer<QDltMsg>::create(); // create new instance to be filled by getMsg(), otherwise shared pointer would be empty or pointing to last message
-
-        if(!dltFile->getMsg(ix, *msg))
+        if(!dltFile->getMsgNoCache(ix, msg, msgBuffer))
             continue; // Skip broken messages
 
-        /*if(true == useIndexerThread)
+        if(true == useIndexerThread)
         {
-            indexerThread.enqueueMessage(msg, ix);
+            QSharedPointer<QDltMsg> msgShared = QSharedPointer<QDltMsg>::create(msg);
+            indexerThread.enqueueMessage(msgShared, ix);
         }
         else
-        {*/
+        {
             indexerThread.processMessage(msg, ix);
-        //}
+        }
 
         if((end-start)!=0)
             iPercent = ( (ix-start)*100 )/(end-start);
@@ -501,11 +504,11 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
         // stop if requested
         if(stopFlag)
         {
-            /*if(useIndexerThread)
+            if(useIndexerThread)
             {
                 indexerThread.requestStop();
                 indexerThread.wait();
-            }*/
+            }
 
             return false;
         }
@@ -513,11 +516,11 @@ bool DltFileIndexer::indexFilter(QStringList filenames)
     emit(progress(100));
     qDebug() << "CFI:" << 100 << "%";
     // destroy threads
-    /*if(true == useIndexerThread)
+    if(true == useIndexerThread)
     {
         indexerThread.requestStop();
         indexerThread.wait();
-    }*/
+    }
 
     // update performance counter
     //msecsFilterCounter = time.elapsed();

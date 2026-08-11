@@ -19,6 +19,7 @@
 
 #include "searchdialog.h"
 #include "ui_searchdialog.h"
+#include "qdltplugin.h"
 #include "qdltoptmanager.h"
 #include "tablemodel.h"
 
@@ -155,14 +156,12 @@ void SearchDialog::appendFindAllMatchesChunk(const QList<unsigned long>& entries
     if (entries.isEmpty())
         return;
 
-    const bool wasEmpty = (m_searchtablemodel->get_SearchResultListSize() == 0);
     // Preserve the scan order (which matches the current filtered/sorted view).
     // Do not sort by raw msg index; that breaks ordering when the view is sorted by time/timestamp.
+    const bool wasEmpty = (m_searchtablemodel->get_SearchResultListSize() == 0);
     m_searchtablemodel->add_SearchResultEntries(entries);
 
     m_findAllAddedSinceLastUiUpdate += entries.size();
-
-    // Throttle table refreshes to keep UI responsive.
     const qint64 nowMs = m_findAllUiUpdateTimer.elapsed();
     const bool timeToUpdate = (nowMs - m_findAllLastUiUpdateMs) >= 200;
     const bool manyNewItems = m_findAllAddedSinceLastUiUpdate >= 2000;
@@ -212,22 +211,22 @@ void SearchDialog::startParallelFindAll(QRegularExpression searchTextRegExp)
     // Snapshot the current filter mapping once on the UI thread.
     // QDltFile's filter index isn't guaranteed thread-safe for concurrent reads.
     const bool useFilterSnapshot = file->isFilter();
-    std::shared_ptr<QVector<int>> filterPositions;
+    std::shared_ptr<QVector<qint64>> filterPositions;
     if (useFilterSnapshot)
     {
-        filterPositions = std::make_shared<QVector<int>>();
-        filterPositions->reserve(total);
-        for (int i = 0; i < total; ++i)
-            filterPositions->push_back(file->getMsgFilterPos(i));
+        filterPositions = std::make_shared<QVector<qint64>>(file->getIndexFilter());
     }
 
     const bool msgIdEnabled = QDltSettingsManager::getInstance()->value("startup/showMsgId", true).toBool();
     const QString msgIdFormat = QDltSettingsManager::getInstance()->value("startup/msgIdFormat", "0x%x").toString();
     const bool pluginsEnabled = QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool();
+    const QList<QDltPlugin*> decoderPlugins = (pluginsEnabled && pluginManager)
+            ? pluginManager->getDecoderPlugins()
+            : QList<QDltPlugin*>();
 
     // Optimization: only decode when payload search is enabled.
     const bool payloadEnabled = getPayload();
-    const bool doDecode = pluginsEnabled && payloadEnabled;
+    const bool doDecode = !decoderPlugins.isEmpty() && payloadEnabled;
 
     const bool headerEnabled = getHeader();
     const bool caseSensitive = getCaseSensitive();
@@ -285,7 +284,7 @@ void SearchDialog::startParallelFindAll(QRegularExpression searchTextRegExp)
     auto processed = std::make_shared<std::atomic<int>>(0);
     const QPointer<SearchDialog> dlg(this);
     QDltFile* filePtr = file;
-    QDltPluginManager* pluginPtr = pluginManager;
+    const QList<QDltPlugin*> decoderPluginsSnapshot = decoderPlugins;
 
     auto mapFn = [=](const Chunk& chunk) -> QList<unsigned long> {
         QList<unsigned long> matches;
@@ -312,19 +311,24 @@ void SearchDialog::startParallelFindAll(QRegularExpression searchTextRegExp)
             if (dlg && dlg->isSearchCancelled.load(std::memory_order_relaxed))
                 break;
 
-            const int msgIndex = (filterPositions ? filterPositions->at(i) : i);
+            const int msgIndex = filterPositions ? static_cast<int>(filterPositions->at(i)) : i;
             if (msgIndex < 0)
                 continue;
 
-            buf = filePtr->getMsg(msgIndex);
-            if (buf.isEmpty())
+            if (!filePtr->getMsgNoCache(msgIndex, msg, buf))
                 continue;
 
-            msg.setMsg(buf);
-            msg.setIndex(msgIndex);
-
-            if (doDecode && pluginPtr)
-                pluginPtr->decodeMsg(msg, dlg ? dlg->fSilentMode : 0);
+            if (doDecode)
+            {
+                for(int decoderIndex = 0; decoderIndex < decoderPluginsSnapshot.size(); ++decoderIndex)
+                {
+                    QDltPlugin *decoder = decoderPluginsSnapshot.at(decoderIndex);
+                    if(decoder != nullptr && decoder->decodeMsg(msg, dlg ? dlg->fSilentMode : 0))
+                    {
+                        break;
+                    }
+                }
+            }
 
             const bool ok = useRegExp ? matcher.match(msg, searchTextRegExp)
                                       : matcher.match(msg, searchText);
@@ -699,6 +703,10 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
     matcher.setHeaderSearchEnabled(getHeader());
     matcher.setPayloadSearchEnabled(getPayload());
 
+    const QList<QDltPlugin*> decoderPlugins = (QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool() && pluginManager)
+            ? pluginManager->getDecoderPlugins()
+            : QList<QDltPlugin*>();
+
     do
     {
         ctr++; // for file progress indication
@@ -731,15 +739,28 @@ void SearchDialog::findMessages(long int searchLine, long int searchBorder, QReg
         }
 
         /* get the message with the selected item id */
-        buf = file->getMsgFilter(searchLine);
-        msg.setMsg(buf);
-        msg.setIndex(file->getMsgFilterPos(searchLine));
+        const int msgIndex = file->getMsgFilterPos(searchLine);
+        if(msgIndex < 0)
+        {
+            continue;
+        }
+
+        if(!file->getMsgNoCache(msgIndex, msg, buf))
+        {
+            continue;
+        }
 
         /* decode the message if desired - could this call be avoided as the message is already decoded elsewhere ? */
-        if(QDltSettingsManager::getInstance()->value("startup/pluginsEnabled", true).toBool())
+        if(!decoderPlugins.isEmpty())
         {
-            //qDebug() << "Decode" << __LINE__;
-            pluginManager->decodeMsg(msg, fSilentMode);
+            for(int decoderIndex = 0; decoderIndex < decoderPlugins.size(); ++decoderIndex)
+            {
+                QDltPlugin *decoder = decoderPlugins.at(decoderIndex);
+                if(decoder != nullptr && decoder->decodeMsg(msg, fSilentMode))
+                {
+                    break;
+                }
+            }
         }
 
         const bool matchFound = getRegExp() ? matcher.match(msg, searchTextRegExp) : matcher.match(msg, getText());

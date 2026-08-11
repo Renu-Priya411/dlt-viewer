@@ -59,7 +59,7 @@ TableModel::TableModel(const QString & /*data*/, QObject *parent)
          return QVariant();
      }
 
-     if (index.row() >= qfile->sizeFilter() && index.row()<0)
+    if (index.row() >= qfile->sizeFilter() || index.row()<0)
      {
          return QVariant();
      }
@@ -342,6 +342,17 @@ QVariant TableModel::headerData(int section, Qt::Orientation orientation,
 
      emit(layoutChanged());
  }
+
+void TableModel::appendRows(int firstRow, int lastRow)
+{
+    if(firstRow < 0 || lastRow < firstRow)
+    {
+        return;
+    }
+
+    beginInsertRows(QModelIndex(), firstRow, lastRow);
+    endInsertRows();
+}
 
 int TableModel::setManualMarker(QList<unsigned long int> selectedRows, QColor hlcolor) //used in mainwindow
 {
